@@ -1,0 +1,5 @@
+-r requirements.lock
+# Resolve and pin the deployed artifact after validating these production dependencies.
+# Django 5.2 supports psycopg 3.1.8 or later; this file is not a deployment lockfile.
+psycopg[binary]>=3.1.8,<4
+gunicorn>=23,<24; sys_platform != "win32"
