@@ -36,6 +36,16 @@ test('a cited claim exposes the original excerpt and the actual calculation in p
   assert.equal(tree.find('details').every(el => !el.open), true);
 });
 
+test('a retrieved web citation exposes its checked excerpt, retrieval date and original page', () => {
+  const evidence = [{id: 'E1', type: 'web', name: '公开条目', excerpt: '原文摘录',
+    retrieved_at: '2026-01-01T00:00:00+00:00', attribution: '条目作者', url: 'https://example.org/page'}];
+  const report_references = [{section: '主要依据', line: '有原文', ids: ['E1']}];
+  const tree = render('## 主要依据\n- 有原文（依据 E1）', {evidence, report_references});
+  assert.equal(tree.find('blockquote')[0].textContent, '原文摘录');
+  assert.ok(tree.find('small')[0].textContent.includes('读取时间'));
+  assert.equal(tree.find('a')[0].href, 'https://example.org/page');
+});
+
 test('only an unambiguous saved finding matches a legacy line without IDs', () => {
   const old = '## 重要分歧与核验\n- 计算有误\n  回应：接受纠错';
   assert.equal(render(old, state).find('details').length, 1);

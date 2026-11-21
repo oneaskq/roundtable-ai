@@ -35,6 +35,17 @@ class TeamConfigurationTests(TestCase):
         save_connection(self.deepseek)
         save_named_connection(self.kimi)
 
+    def test_decision_readiness_counts_distinct_accepted_connections(self):
+        with patch('delivery.team_config.chat_available', return_value=True):
+            one = team_summary(resolve_team())
+            self.assertEqual(one['readiness'], 'available')  # Non-decision workflows remain available.
+            self.assertFalse(one['decision_ready'])
+            self.assertEqual(one['ready_connections'], 1)
+            self.assertIn('1 个', one['decision_hint'])
+            two = team_summary(resolve_team({'reviewer': 'kimi'}))
+            self.assertTrue(two['decision_ready'])
+            self.assertEqual(two['ready_connections'], 2)
+
     def approve(self, connection):
         for capability in IMPLEMENTED:
             CapabilityEvidence.objects.create(

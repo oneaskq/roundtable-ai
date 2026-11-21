@@ -96,6 +96,44 @@ class DecisionEngineTests(TestCase):
     def after(self, stage, output):
         pass
 
+    @patch('delivery.decision_team_engine.lookup_public_sources')
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_only_approved_query_leaves_and_fetched_source_reaches_review(self, generate, lookup):
+        def generated(messages, **kwargs):
+            self.packets[self.stage] = json.loads(messages[0]['content'])
+            value = fixture(self.stage)
+            if self.stage == 'review_p1':
+                value['findings'][0]['evidence'] = [
+                    {'source': 'W1', 'quote': '日期未定', 'scope': '尚未确认日期'}]
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        self.state['public_search_query'] = '公开通知'
+        self.state['public_search_provider'] = '维基百科'
+        source = {'name': '条目', 'content': '日期未定', 'url': 'https://example.org/article',
+                  'kind': 'web', 'reference': 'W1', 'sha256': 'b' * 64,
+                  'retrieved_at': '2026-01-01T00:00:00+00:00'}
+        lookup.return_value = ({'provider': '维基百科', 'status': 'found', 'sources': [source]}, [source])
+        report = run_decision(self.context, self.connections, self.state, self.before, self.after,
+                              lambda _: None, before_discussion=lambda *args: None)
+        lookup.assert_called_once_with('公开通知', '维基百科')
+        self.assertIn('百科背景', self.packets['analysis_p1']['research_scope'])
+        self.assertIn('W1', [s['reference'] for s in self.packets['review_p1']['sources']])
+        self.assertIn(source['url'], str(report))
+        citation = next(e for e in self.state['evidence'] if e.get('source') == 'W1')
+        self.assertEqual((citation['url'], citation['excerpt'], citation['retrieved_at']),
+                         (source['url'], '日期未定', source['retrieved_at']))
+
+    @patch('delivery.decision_team_engine.lookup_public_sources')
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_ignoring_a_proposed_query_sends_no_request(self, generate, lookup):
+        generate.side_effect = self.generator
+        self.prepared()
+        self.state['brief_draft']['public_search_query'] = '建议但未获授权'
+        report = run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        lookup.assert_not_called()
+        self.assertIn('未联网搜索', str(report))
+
     def generator(self, messages, **kwargs):
         self.packets[self.stage] = json.loads(messages[0]['content'])
         return json.dumps(fixture(self.stage), ensure_ascii=False)

@@ -538,6 +538,7 @@ def confirm_decision_brief(request, conversation_id):
     except (ValueError, TypeError, AttributeError):
         return JsonResponse({'error': '问题说明标识无效，请刷新后重试。'}, status=400)
     from .decision_team_engine import BRIEF_FIELDS, confirm_brief
+    from .public_research import approved_query, search_provider_name
     with transaction.atomic():
         conversation = lock_conversation(request.user, conversation_id)
         run = TeamRun.objects.filter(pk=run_id, task__conversation=conversation,
@@ -545,6 +546,14 @@ def confirm_decision_brief(request, conversation_id):
         if not run:
             return JsonResponse({'error': '讨论记录不存在。'}, status=404)
         state = dict(run.decision_state)
+        try:
+            search_query = approved_query(request.payload.get('public_search_query'), request.payload.get('public_search_consent'))
+        except ValueError as error:
+            return JsonResponse({'error': str(error)}, status=400)
+        draft = state.get('brief_draft', {})
+        offered = draft.get('public_search_query') or draft.get('public_search_requested')
+        if search_query and (not offered or request.payload.get('public_search_provider') != draft.get('public_search_provider')):
+            return JsonResponse({'error': '检索建议已变化，请刷新后核对。', 'code': 'brief_stale'}, status=409)
         conversational = 'answer' in request.payload
         answer = request.payload.get('answer') if conversational else None
         if conversational and (not isinstance(answer, str) or len(answer) > 2000):
@@ -561,7 +570,8 @@ def confirm_decision_brief(request, conversation_id):
             return JsonResponse({'error': str(error)}, status=400)
         if run.status != 'awaiting_input':
             saved = state.get('brief', {})
-            if (saved and all(saved.get(key) == brief.get(key) for key in BRIEF_FIELDS)
+            if (saved and state.get('public_search_query', '') == search_query
+                    and all(saved.get(key) == brief.get(key) for key in BRIEF_FIELDS)
                     and run.status in ('queued', 'running', 'completed')):
                 return JsonResponse({'accepted': True, 'replayed': True, 'run': serialize_run(run),
                                      'task': task_data(run.task)})
@@ -582,6 +592,12 @@ def confirm_decision_brief(request, conversation_id):
             return JsonResponse({'error': '团队连接已改变，请重新开始一轮。', 'code': 'team_changed'}, status=409)
         if current['readiness'] != 'available' or not constant_time_compare(current['revision'], run.team_revision):
             return JsonResponse({'error': '团队连接或验收状态已改变，请重新开始一轮。', 'code': 'team_changed'}, status=409)
+        if search_query:
+            provider = search_provider_name()
+            if provider != draft['public_search_provider']:
+                return JsonResponse({'error': '检索服务已变化，本次可以跳过检索。'}, status=409)
+            state['public_search_query'] = search_query
+            state['public_search_provider'] = provider
         expected_clarification_calls = state.get('clarification_calls', 1)
         if (expected_clarification_calls not in (1, 2) or run.calls_used != expected_clarification_calls
                 or not AgentStep.objects.filter(run=run, role='clarifier', status='completed').exists()
@@ -615,6 +631,7 @@ def confirm_decision_brief(request, conversation_id):
             state['brief_user_confirmed'] = False
             state['brief'].pop('confirmed_at', None)
         state['phase'] = 'confirmed'
+        state['clarification_wait_ms'] = max(0, round((timezone.now() - task.updated_at).total_seconds() * 1000))
         run.decision_state = state
         run.input_context = context
         run.status = 'queued'
@@ -891,6 +908,9 @@ def _execute_team_run(run, *, context=None, connections=None):
             if state.get('phase') == 'drafting':
                 state['quick_disabled'] = run.interjections.filter(status='pending').exists()
                 draft = prepare_brief(context, connections, state, before_step, after_step)
+                if draft.get('public_search_query') or draft.get('public_search_requested'):
+                    from .public_research import search_provider_name
+                    draft['public_search_provider'] = search_provider_name()
                 if draft.get('mode') != 'quick' and draft.get('questions') and state.get('clarify_peer_enabled'):
                     first = connections['synthesizer']
                     peer = next((part for part in state['participants']
@@ -948,6 +968,7 @@ def _execute_team_run(run, *, context=None, connections=None):
                         check_active()
                         TeamRun.objects.filter(pk=run.pk, status='running').update(decision_state=state, updated_at=timezone.now())
                 elif (state.get('clarify_peer_enabled') and not draft.get('questions')
+                      and not draft.get('public_search_query') and not draft.get('public_search_requested')
                       and not run.interjections.filter(status='pending').exists()):
                     with transaction.atomic():
                         lock_conversation(request.user, conversation_id)

@@ -165,6 +165,8 @@
       ? entry.expression + " = " + entry.result : entry.excerpt));
     if (entry.scope) detail.append(node("p", "", entry.scope));
     if (entry.type === "web" && entry.url) {
+      if (entry.retrieved_at) detail.append(node("small", "", "读取时间 " + entry.retrieved_at));
+      if (entry.attribution) detail.append(node("small", "", entry.attribution));
       const origin = link("打开原网页", entry.url);
       if (origin) detail.append(origin);
     }

@@ -296,9 +296,9 @@ def _decode(raw, content_type):
         raise SourceFetchError('网页文字编码不支持或正文无效，未保存不完整内容。') from None
 
 
-def fetch_public_source(url):
+def fetch_public_source(url, *, timeout=FETCH_TIMEOUT_SECONDS):
     """Return source text and provenance, never a fact-check or model output."""
-    deadline = time.monotonic() + FETCH_TIMEOUT_SECONDS
+    deadline = time.monotonic() + min(timeout, FETCH_TIMEOUT_SECONDS)
     current, _, _ = _normalize_url(url)
     seen = set()
     try:

@@ -406,7 +406,8 @@ function renderConversationList() {
 
 function chatAvailable() {
   const team = state.capabilities?.team;
-  return team?.readiness === "available" && typeof team.revision === "string" && Boolean(team.revision);
+  return team?.readiness === "available" && typeof team.revision === "string" && Boolean(team.revision)
+    && (state.deliveryMode !== "text" || team.decision_ready !== false);
 }
 function modelIdentity() {
   const revision = state.capabilities?.team?.revision; const cases = state.conversation?.acceptance_cases || [];
@@ -468,6 +469,11 @@ function renderModelControls() {
   $("#connection-instructions").textContent = state.deliveryMode === "text" ? "团队先分别独立分析，再交叉核验和回应；模型分工及实际效果仍需实测比较。" : "主助手先安排2至4项成员工作，再按依赖组织执行、交叉审查与核验。具体成员任务会出现在协作记录中；最佳模型仍需实测比较。";
   $("#availability-text").textContent = clarifying ? "回复或跳过后，团队将按本轮已确认的额度继续。" : running ? "后台处理本轮任务 · 停止后可继续发送" : state.capabilityError || (available ? (state.aiEnabled ? `AI 已开启 · 最多 ${deliveryLimit()} 次调用，使用模型额度` : state.saveOnlyMode ? "仅保存到圆桌" : "首次发送时确认参与的模型和费用") : team?.configured ? "模型待验收 · 当前仅保存需求" : team ? "AI 未配置 · 当前仅保存需求" : "读取团队状态中…");
   if ($("#composer-options-label")) $("#composer-options-label").textContent = state.deliveryMode === "files" ? "多文件成果" : state.deliveryMode === "text_adaptive" ? "文字任务" : "文字讨论";
+  if (!running && !clarifying && state.deliveryMode === "text" && team?.decision_hint) {
+    $("#availability-text").textContent = team.decision_hint + " 当前可保存问题。";
+    $("#connection-summary").textContent = team.decision_hint;
+    $("#message-input").placeholder = "写下想讨论的问题，可先保存";
+  }
   const sendForDiscussion = available && (state.aiEnabled || !state.saveOnlyMode);
   const actionLabel = clarifying ? "发送回答并继续" : running ? "协作中" : task?.status === "paused" ? "保存补充" : sendForDiscussion ? "发送并开始团队协作" : "保存需求";
   $("#send-message").setAttribute("aria-label", actionLabel); $("#send-message").title = actionLabel;
@@ -621,12 +627,26 @@ function renderReplyFeedback() {
   else if (task?.runs?.[0]?.status === "needs_review" && !text) text = "核验发现待修订项，可查看协作记录并补充要求。";
   else if (task?.status === "failed" && !text) text = task.runs?.[0]?.error || "本轮未完成。需求已保存，可查看记录后重新协作。";
   else if (task?.status === "waiting" && !text) {
-    text = !chatAvailable() ? (state.capabilityError || (state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看团队与模型。" : "需求已保存，正在读取团队状态。"))
+    text = !chatAvailable() ? (state.capabilityError || (state.deliveryMode === "text" && state.capabilities?.team?.decision_hint ? "问题已保存。" + state.capabilities.team.decision_hint : state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看团队与模型。" : "需求已保存，正在读取团队状态。"))
       : state.aiEnabled ? "需求已保存，可以开始协作。" : "需求已保存，尚未开始回复。请先开启 AI 团队。";
   }
   $("#reply-feedback").hidden = !text && !needsBrief; $("#reply-feedback-text").hidden = !text; $("#reply-feedback-text").textContent = text;
   $("#reply-feedback").classList.toggle("has-error", !pending && (feedback?.error || task?.status === "failed"));
   $("#request-reply").hidden = needsBrief || Boolean(unresolved) || !task || !["waiting", "failed"].includes(task.status) || pending || !chatAvailable();
+  const run = task?.runs?.[0];
+  const draft = needsBrief && run.decision?.brief_draft;
+  const lookup = $("#lookup-offer");
+  if (lookup) {
+    lookup.hidden = !(draft?.public_search_query || draft?.public_search_requested);
+    if (!lookup.hidden && lookup.dataset.run !== run.id) {
+      $("#lookup-query").value = draft.public_search_query || "";
+      $("#lookup-provider").textContent = "· " + draft.public_search_provider;
+      lookup.dataset.run = run.id;
+    }
+    if (lookup.hidden) delete lookup.dataset.run;
+    $("#lookup-continue").disabled = Boolean(state.activeSave) || Boolean(state.activeReply);
+  }
+  $("#skip-clarification").textContent = draft?.public_search_query || draft?.public_search_requested ? "跳过检索，继续讨论" : "暂不回答，继续讨论";
   $("#skip-clarification").hidden = !needsBrief;
   $("#skip-clarification").disabled = Boolean(state.activeSave) || Boolean(state.activeReply);
   $("#request-reply").textContent = feedback?.briefStale ? "重新整理问题" : !state.aiEnabled ? "开启 AI 团队" : task?.status === "failed" || feedback?.error ? "重新协作" : "开始团队协作";
@@ -718,16 +738,17 @@ async function reloadConversation(id, version = state.viewVersion) {
   if (["completed", "paused"].includes(currentTask()?.status)) delete state.replyFeedback[id];
   renderChat(true); renderConversationList(); resumeReplyMonitoring(); return true;
 }
-async function submitClarification(answer, previous = null) {
+async function submitClarification(answer, previous = null, search = null) {
   const run = previous || currentTask()?.runs?.[0]; const conversationId = state.conversation?.id;
   if (!conversationId || !run || (!previous && (run.status !== "awaiting_input" || state.activeReply)) || state.activeSave) return;
   if (answer.length > 2000) { showToast("补充回答最多 2000 字。", true); return; }
   const operation = {version: state.viewVersion, authVersion: state.authVersion, conversationId};
-  if (answer) saveInterjectionDraft(conversationId, {kind: "clarification", runId: run.id, text: answer, maxCalls: run.max_calls});
+  if (answer) saveInterjectionDraft(conversationId, {kind: "clarification", runId: run.id, text: answer, maxCalls: run.max_calls, search});
   state.activeSave = operation; state.conversationRevision++; renderModelControls();
   try {
     await api(`/api/conversations/${encodeURIComponent(conversationId)}/confirm-decision`, {method: "POST", signal: AbortSignal.timeout?.(30000),
-      body: {run_id: run.id, answer, confirm_continue: true, expected_max_calls: run.max_calls}});
+      body: {run_id: run.id, answer, confirm_continue: true, expected_max_calls: run.max_calls,
+        ...(search ? {public_search_query: search.query, public_search_provider: search.provider, public_search_consent: true} : {})}});
     if (operation.authVersion !== state.authVersion) return;
     if (answer && interjectionDraft(conversationId)?.kind === "clarification" && interjectionDraft(conversationId)?.text === answer) {
       saveInterjectionDraft(conversationId, null);
@@ -1109,9 +1130,19 @@ function renderDiscussionTimeline(timeline) {
 }
 function teamChatMessage(item, run, stage = null, members = [item]) {
   const isUser = item.kind === "user";
-  const name = isUser ? "你" : members.map(member => providerName(member.provider)).join("、");
-  const metadata = members.map(member => [member.model, member.label, dateText(member.created_at)].filter(Boolean).join(" · ")).join("\n");
+  const speakers = members.map(member => {
+    const id = /^analysis_(p\d+)$/.exec(member.role)?.[1];
+    const assignment = id && run.decision?.participants?.find(part => part.id === id)?.assignment;
+    return {member, assignment};
+  });
+  const name = isUser ? "你" : speakers.map(({member, assignment}) =>
+    providerName(member.provider) + (speakers.length > 1 && assignment ? '（' + assignment.label + '）' : '')
+  ).join("、");
+  const metadata = speakers.map(({member, assignment}) =>
+    [member.model, member.label, assignment?.task, assignment?.focus, dateText(member.created_at)].filter(Boolean).join(" · ")
+  ).join("\n");
   const label = stage ?? (item.role !== 'clarifier' && !item.role?.startsWith('quick_') ? item.label : "");
+  const subtitle = [label, speakers.length === 1 && speakers[0].assignment?.label].filter(Boolean).join(" · ");
   const target = isUser && item.target_provider ? `@${providerName(item.target_provider)}` : "";
   const text = el("div", { class: "team-chat-bubble" });
   if (target) text.append(el("span", { class: "team-chat-mention", text: target + " " }));
@@ -1122,7 +1153,7 @@ function teamChatMessage(item, run, stage = null, members = [item]) {
   const status = !isUser ? "" : item.status === "pending" ? (["queued", "running", "awaiting_input"].includes(run.status) ? "等待后续讨论采用" : "本轮未处理，已留给下一轮") : item.status === "included" ? "已纳入讨论" : item.status === "answered" ? "成员已回应" : "";
   return el("article", { class: `team-chat-message${isUser ? " is-user" : ""}` }, [
     teamChatAvatar(item.provider, isUser),
-    el("div", { class: "team-chat-message-body" }, [el("div", { class: "team-chat-meta" }, [el("strong", { text: name, title: metadata }), !isUser && label ? el("span", {text:label}) : null]), text, copy, status ? el("small", { class: "team-chat-status", text: status }) : null]),
+    el("div", { class: "team-chat-message-body" }, [el("div", { class: "team-chat-meta" }, [el("strong", { text: name, title: metadata }), !isUser && subtitle ? el("span", {text:subtitle}) : null]), text, copy, status ? el("small", { class: "team-chat-status", text: status }) : null]),
   ]);
 }
 function teamChatHistory(run) {
@@ -1320,11 +1351,14 @@ function renderTeamProgress(task) {
   $("#live-draft").hidden = true;
   $("#live-draft-content").textContent = "";
   const attempts = latest?.status === "failed" ? (latest.calls_used ? ` · 已记录 ${latest.calls_used} 次调用尝试，可能计费；未自动重试` : " · 没有记录模型调用尝试；未自动重试") : "";
-  const progress = !latest && pending ? "正在提交…" : latest?.status === "queued" ? "已排队 · 等待后台处理" : latest?.status === "running" ? `协作中${active ? ` · 正在${active.label || active.role}` : ""}` : latest?.status === "failed" ? `本轮未完成${attempts}` : "";
+  const phases = {research: "正在读取公开资料", analysis: "成员正在独立判断", review: "正在核对关键主张", response: "正在回应质疑", synthesis: "正在整理最终建议"};
+  const currentStage = latest?.decision?.phase === "research" ? phases.research : active ? "正在" + (active.label || active.role) : phases[latest?.decision?.phase] || "团队正在讨论";
+  const progress = !latest && pending ? "正在提交…" : latest?.status === "queued" ? "已排队 · 等待后台处理" : latest?.status === "running" ? currentStage : latest?.status === "failed" ? `本轮未完成${attempts}` : "";
   // Keep the live region quiet unless the actual progress changes.
   if ($("#team-progress-text").textContent !== progress) $("#team-progress-text").textContent = progress;
   $("#team-progress-text").hidden = !progress;
   $("#team-progress").hidden = !progress;
+  window.RoundtableTiming?.monitor($("#discussion-time"), latest);
   const recordSignature = JSON.stringify(runs.map((run) => ({...run, steps: (run.steps || []).map((step) => step.status === "running" ? {...step, output: ""} : step)})));
   if ($("#team-runs").dataset.signature === recordSignature) return;
   $("#team-runs").dataset.signature = recordSignature;
@@ -1381,7 +1415,10 @@ function renderTeamProgress(task) {
         source.kind === "web" ? el("p", { text: source.source_url }) : null,
       ]))), el("p", { class: "team-scope", text: "这里记录启动时选定的资料，后续选择不改变本轮记录。网页读取不代表事实核验。" }),
     ]) : null;
-    const details = el("details", { class: "team-chat-details", dataset: { record: `${run.id}-details` } }, [el("summary", { text: "查看阶段记录与检查" }), isQuick ? null : decisionRecord(run, opened), sourceView, acceptanceRunSnapshot(run, opened), planView, ...steps, ...systemChecks]);
+    const timing = window.RoundtableTiming?.metrics(run) || [];
+    const details = el("details", { class: "team-chat-details", dataset: { record: `${run.id}-details` } }, [el("summary", { text: "查看阶段记录与检查" }),
+      timing.length ? el("p", { class: "team-scope", text: timing.join(" · ") }) : null,
+      isQuick ? null : decisionRecord(run, opened), sourceView, acceptanceRunSnapshot(run, opened), planView, ...steps, ...systemChecks]);
     details.open = opened.has(`${run.id}-details`);
     const historyId = `${run.id}-discussion`;
     const discussion = run.workflow === "decision_v1" ? null : el("details", { class: "team-chat-details", dataset: { record: historyId } }, [el("summary", { text: "查看团队发言" }), teamChatHistory(run)]);
@@ -1822,7 +1859,14 @@ $("#request-reply").addEventListener("click", () => {
   }
   void requestReply();
 });
-$("#skip-clarification").addEventListener("click", () => { void submitClarification(""); });
+$("#skip-clarification").addEventListener("click", () => { void submitClarification($("#message-input").value.trim()); });
+$("#lookup-continue")?.addEventListener("click", () => {
+  const run = currentTask()?.runs?.[0];
+  const query = $("#lookup-query").value.trim();
+  if (!run || $("#lookup-offer").hidden || $("#lookup-offer").dataset.run !== run.id) return;
+  if (!query) { $("#lookup-query").focus(); return; }
+  void submitClarification($("#message-input").value.trim(), null, {query, provider: run.decision.brief_draft.public_search_provider});
+});
 $("#delete-conversation").addEventListener("click", () => {
   const id = state.conversation?.id; const authVersion = state.authVersion;
   if (!id || state.activeReply || state.activeSave || pendingSubmission(id)) return;
@@ -1878,7 +1922,7 @@ $("#composer").addEventListener("submit", async (event) => {
   event.preventDefault(); const content = $("#message-input").value.trim(); if (!content) return;
   const pendingAnswer = interjectionDraft();
   if (pendingAnswer?.kind === "clarification" && pendingAnswer.text === content) {
-    await submitClarification(content, {id: pendingAnswer.runId, max_calls: pendingAnswer.maxCalls}); return;
+    await submitClarification(content, {id: pendingAnswer.runId, max_calls: pendingAnswer.maxCalls}, pendingAnswer.search); return;
   }
   const liveRun = interjectionRun();
   if (liveRun) { await sendInterjection(liveRun, content); return; }

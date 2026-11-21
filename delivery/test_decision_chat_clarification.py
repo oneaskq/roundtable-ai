@@ -48,6 +48,31 @@ class ChatClarificationTests(TestCase):
             process_next_run()
         return TeamRun.objects.get()
 
+    def test_suggested_research_pauses_without_questions_and_needs_explicit_consent(self):
+        original = fixture
+        def suggest(stage):
+            return ({**original(stage), 'questions': [], 'public_search_query': '实习岗位要求'}
+                    if stage == 'clarifier' else original(stage))
+        with patch(__name__ + '.fixture', side_effect=suggest):
+            run = self.start()
+        self.assertEqual(run.status, 'awaiting_input')
+        draft = run.decision_state['brief_draft']
+        provider = draft['public_search_provider']
+        self.assertEqual(draft['public_search_query'], '实习岗位要求')
+        self.assertNotIn('public_search_query', run.decision_state)
+        payload = {'run_id': str(run.id), 'answer': '', 'confirm_continue': True,
+                   'expected_max_calls': run.max_calls, 'public_search_query': '公开岗位条件',
+                   'public_search_provider': provider}
+        self.assertEqual(self.client.post(self.url, payload, content_type='application/json').status_code, 400)
+        payload['public_search_consent'] = True
+        self.assertEqual(self.client.post(self.url, payload, content_type='application/json').status_code, 202)
+        run.refresh_from_db()
+        self.assertEqual(run.decision_state['public_search_query'], '公开岗位条件')
+        self.assertEqual(run.decision_state['public_search_provider'], provider)
+        self.assertGreaterEqual(run.decision_state['clarification_wait_ms'], 0)
+        self.assertEqual(self.client.post(self.url, payload, content_type='application/json').status_code, 200)
+        self.assertEqual(self.answer(run, '').status_code, 409)
+
     def answer(self, run, text):
         return self.client.post(self.url, json.dumps({'run_id': str(run.id), 'answer': text,
                                 'confirm_continue': True, 'expected_max_calls': run.max_calls}),

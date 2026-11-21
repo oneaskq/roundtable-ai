@@ -11,7 +11,7 @@ os.environ['MFA_ENCRYPTION_KEY'] = Fernet.generate_key().decode('ascii')
 os.environ['ROUNDTABLE_IGNORE_LOCAL_MAIL'] = '1'
 for _key in ('ROUNDTABLE_AI_PROVIDER', 'ROUNDTABLE_AI_MODEL', 'ROUNDTABLE_SERVICE_REGION',
              'ROUNDTABLE_AI_REASONING_EFFORT', 'DEEPSEEK_API_KEY', 'KIMI_API_KEY',
-             'QWEN_API_KEY', 'QWENCLOUD_API_KEY', 'DASHSCOPE_API_KEY', 'AI_GATEWAY_API_KEY'):
+             'QWEN_API_KEY', 'QWENCLOUD_API_KEY', 'DASHSCOPE_API_KEY', 'AI_GATEWAY_API_KEY', 'BRAVE_SEARCH_API_KEY'):
     os.environ.pop(_key, None)
 
 from .settings import *

@@ -1,0 +1,6 @@
+.lookup-offer:not([hidden]) { display: grid; gap: .5rem; width: min(100%, 33rem); margin: .75rem 0; padding: .9rem 1rem; border: 1px solid var(--line, #dedede); border-radius: 12px; }
+.lookup-offer label { font-weight: 600; }
+.lookup-offer label span, .lookup-offer small, #discussion-time { color: var(--muted, #666); font-size: .8rem; }
+.lookup-offer input { width: 100%; min-width: 0; padding: .45rem .65rem; border: 1px solid var(--line, #dedede); border-radius: 6px; }
+.lookup-offer button { justify-self: start; }
+#discussion-time { font-variant-numeric: tabular-nums; }

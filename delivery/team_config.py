@@ -108,7 +108,18 @@ def team_summary(connections=None):
                           'model': connection.model, 'ready': readiness[connection.fingerprint]})
         configured = all(connection.configured for connection in connections.values())
         available = configured and all(item['ready'] for item in roles)
-        return {'configured': configured,
+        ready_count = sum(bool(ready) for ready in readiness.values())
+        decision_ready = available and ready_count >= 2
+        decision_hint = ''
+        if not decision_ready:
+            if ready_count == 1:
+                decision_hint = '已有 1 个模型就绪，再接入 1 个不同模型即可开始圆桌讨论。'
+            elif not ready_count:
+                decision_hint = '圆桌讨论需要至少 2 个就绪的不同模型。'
+            else:
+                decision_hint = '团队还有未就绪的成员。'
+        return {'configured': configured, 'decision_ready': decision_ready,
+                'ready_connections': ready_count, 'decision_hint': decision_hint,
                 'readiness': 'available' if available else 'pending' if configured else 'unconfigured',
                 'revision': revision, 'roles': roles, 'max_calls': MAX_CALLS,
                 'delivery_modes': [{'id': key, 'max_calls': value} for key, value in MODE_MAX_CALLS.items()],
@@ -118,7 +129,8 @@ def team_summary(connections=None):
                 'notice': ('文字讨论先确认问题，再独立分析、互相质疑并回应，必要时追加一轮；最多14次调用。多文件任务最多10次调用（包含一次修订）；每次最多4096 tokens，计入每小时20次额度。模型分工仍待实测优选。'
                            if available else '任务规划与分工流程已接入；参与模型仍须分别通过真实验收，未验收时不会启动。当前模型分工尚未经过效果比较。')}
     except ConnectionError as error:
-        return {'configured': False, 'readiness': 'pending', 'revision': '',
+        return {'configured': False, 'readiness': 'pending', 'revision': '', 'decision_ready': False,
+                'decision_hint': str(error),
                 'delivery_modes': [{'id': key, 'max_calls': value} for key, value in MODE_MAX_CALLS.items()],
                 'default_workflow': 'decision_v1', 'decision_max_calls': DECISION_MAX_CALLS,
                 'adaptive_modes': [{'id': key, 'max_calls': value} for key, value in ADAPTIVE_MODE_MAX_CALLS.items()],
