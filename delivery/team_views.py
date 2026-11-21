@@ -18,6 +18,7 @@ from .acceptance_cases import case_revision, normalize_cases
 from .check_summaries import model_validation
 from .connections import ConnectionError
 from .execution import readiness
+from .member_address import addressed_provider, member_connection
 from .models import AgentStep, RequestBudget, TeamRun, TeamInterjection
 from .provider import ProviderError, generate_reply
 from .planning import PlanToolsUnavailable
@@ -34,23 +35,33 @@ class RunStopped(Exception):
 
 @api('POST')
 def team_message(request, conversation_id):
+    return _post_team_message(request, conversation_id, request.payload)
+
+
+def _post_team_message(request, conversation_id, payload):
     try:
-        run_id = uuid.UUID(request.payload.get('run_id', ''))
-        request_id = uuid.UUID(request.payload.get('client_request_id', ''))
+        run_id = uuid.UUID(payload.get('run_id', ''))
+        request_id = uuid.UUID(payload.get('client_request_id', ''))
     except (ValueError, TypeError, AttributeError):
         return JsonResponse({'error': '消息标识无效，请刷新后重试。'}, status=400)
-    content = request.payload.get('content')
-    target = request.payload.get('target_provider', '')
+    content = payload.get('content')
+    target = payload.get('target_provider', '')
     if not isinstance(content, str) or not content.strip() or len(content) > 2000:
         return JsonResponse({'error': '消息须为 1 至 2000 个字符。'}, status=400)
     if not isinstance(target, str):
         return JsonResponse({'error': '指定成员无效。'}, status=400)
+    addressed = addressed_provider(content)
+    if target and addressed and addressed != target:
+        return JsonResponse({'error': '文字点名与所选成员不一致。'}, status=400)
+    target = target or addressed
     with transaction.atomic():
         conversation = lock_conversation(request.user, conversation_id)
         existing = TeamInterjection.objects.filter(client_request_id=request_id).first()
         if existing:
+            same_target = (existing.target_provider == target or
+                           (not payload.get('target_provider') and not existing.target_provider))
             if (existing.run.task.conversation_id != conversation.id or existing.run_id != run_id
-                    or existing.content != content.strip() or existing.target_provider != target):
+                    or existing.content != content.strip() or not same_target):
                 return JsonResponse({'error': '消息标识已使用，请刷新后重试。'}, status=409)
             return JsonResponse({'accepted': True, 'id': str(existing.id), 'status': existing.status,
                                  'continuation_required': existing.status == 'pending' and
@@ -63,6 +74,9 @@ def team_message(request, conversation_id):
                                         task__superseded_by_message__isnull=True).order_by('-created_at', '-id').first()
         if latest is None or latest.id != run.id:
             return JsonResponse({'error': '这条补充属于先前的讨论。', 'code': 'interjection_round_closed'}, status=409)
+        waiting_mention = bool(target and run.status == 'awaiting_input' and run.workflow == 'decision_v1')
+        if payload.get('intent') == 'clarification_mention' and not waiting_mention:
+            return JsonResponse({'error': '点名时这轮讨论的状态已改变，请刷新后重试。', 'code': 'mention_phase_changed'}, status=409)
         continuing = run.status not in ('queued', 'running', 'awaiting_input')
         if continuing and run.status not in ('completed', 'failed', 'needs_review'):
             return JsonResponse({'error': '这轮讨论已停止接收补充。', 'code': 'interjection_round_closed'}, status=409)
@@ -74,15 +88,26 @@ def team_message(request, conversation_id):
             return JsonResponse({'error': '团队连接不可用，请刷新后重试。'}, status=409)
         if target and target not in {connection.provider for connection in connections.values()}:
             return JsonResponse({'error': '指定成员不在当前团队中。'}, status=400)
-        if target and len({connection.fingerprint for connection in connections.values()
-                           if connection.provider == target}) != 1:
-            return JsonResponse({'error': '该服务商对应多个模型，无法唯一确定成员。'}, status=409)
+        if target:
+            try:
+                member_connection(connections, target, run.decision_state.get('participants'))
+            except ProviderError as error:
+                return JsonResponse({'error': str(error)}, status=409)
         if run.interjections.count() >= 20:
             return JsonResponse({'error': '本轮插话已达到上限，请在下一轮继续。'}, status=429)
+        if waiting_mention:
+            from .clarification_mentions import check_mention, room_for_mention
+            try:
+                check_mention(run, target, connections)
+            except (ProviderError, ConnectionError) as error:
+                return JsonResponse({'error': str(error)}, status=409)
+            if not room_for_mention(run, include_queued=True) or not RequestBudget.snapshot(request.user)['remaining']:
+                return JsonResponse({'error': '当前额度不足以单独点名并保留后续讨论所需的调用。'}, status=429)
         TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
         order = TeamRun.objects.values_list('discussion_counter', flat=True).get(pk=run.pk)
         item = TeamInterjection.objects.create(run=run, client_request_id=request_id,
-            content=content.strip(), target_provider=target, public_order=order)
+            content=content.strip(), target_provider=target, public_order=order,
+            status='mention_queued' if waiting_mention else 'pending')
         result = {'accepted': True, 'id': str(item.id), 'status': item.status,
                   'continuation_required': continuing}
         if continuing:
@@ -311,8 +336,10 @@ def collaborate(request, conversation_id):
         return JsonResponse({'error': '讨论成员数量无效，请选择两位或默认数量。'}, status=400)
     max_calls = (DECISION_MAX_CALLS if workflow == 'decision_v1' else
                  (ADAPTIVE_MODE_MAX_CALLS if workflow == 'adaptive' else MODE_MAX_CALLS)[mode])
+    consented_calls = request.payload.get('expected_max_calls')
+    one_call_only = workflow == 'decision_v1' and type(consented_calls) is int and consented_calls == 1
     if (mode == 'files' or workflow in ('adaptive', 'decision_v1')) and (type(request.payload.get('expected_max_calls')) is not int
-                            or request.payload['expected_max_calls'] != max_calls):
+                            or (consented_calls != max_calls and not one_call_only)):
         return JsonResponse({'error': f'本轮包含任务规划与审查，请重新确认最多 {max_calls} 次模型调用。'}, status=400)
     with transaction.atomic():
         # Serialize queue creation with account deletion (including SQLite).
@@ -410,6 +437,18 @@ def collaborate(request, conversation_id):
             report = resolve_report(conversation, task.goal, selected_sources=source_snapshot)
             if report:
                 decision_state['followup_report'] = report
+            from .report_followups import split_report_quote
+            target = addressed_provider(split_report_quote(task.goal)[2])
+            if target:
+                try:
+                    member_connection(connections, target, decision_state['participants'])
+                except ProviderError as error:
+                    return JsonResponse({'error': str(error), 'code': 'member_unavailable'}, status=409)
+                decision_state['direct_provider'] = target
+                decision_state['response_kind'] = 'direct_member'
+                max_calls = 1
+            elif one_call_only:
+                return JsonResponse({'error': '这条消息没有唯一指定成员，仅授权一次调用不会启动团队讨论。'}, status=400)
         from .decision_lifecycle import invalidate_waiting_decisions
         invalidate_waiting_decisions(conversation, request.user, '已开始新一轮；原问题说明未继续。')
         execution_id = uuid.uuid4()
@@ -442,6 +481,8 @@ def collaborate(request, conversation_id):
                 run__task__conversation=conversation, run__task__owner=request.user,
                 run__task__superseded_by_message__isnull=True, status='pending').exclude(run=run))
             for item in deferred:
+                if decision_state.get('direct_provider') and item.target_provider not in ('', decision_state['direct_provider']):
+                    continue
                 TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
                 order = TeamRun.objects.values_list('discussion_counter', flat=True).get(pk=run.pk)
                 TeamInterjection.objects.create(run=run, client_request_id=uuid.uuid4(),
@@ -454,7 +495,11 @@ def collaborate(request, conversation_id):
         source_roles = {'repair': 'synthesizer', 'recheck': 'verifier', 'planner': 'synthesizer'}
         if workflow == 'decision_v1':
             from .decision_team_engine import planned_steps
-            decision_steps = planned_steps(decision_state)
+            if decision_state.get('direct_provider'):
+                member = next(p for p in decision_state['participants'] if p['provider'] == decision_state['direct_provider'])
+                decision_steps = [(f'quick_{member["id"]}', '点名回复', member['role'])]
+            else:
+                decision_steps = planned_steps(decision_state)
             AgentStep.objects.bulk_create([
                 AgentStep(run=run, position=index, role=role, label=label,
                           provider=connections[source].provider, model=connections[source].model)
@@ -532,7 +577,16 @@ def collaborate(request, conversation_id):
 
 @api('POST')
 def confirm_decision_brief(request, conversation_id):
-    """Explicitly resume one previously charged clarification, at most once."""
+    """Resume a clarification, or ask a single member without confirming the brief."""
+    answer_text = request.payload.get('answer')
+    if isinstance(answer_text, str) and not request.payload.get('public_search_consent'):
+        from .member_address import addressed_provider
+        target = addressed_provider(answer_text)
+        if target:
+            return _post_team_message(request, conversation_id, {
+                'run_id': request.payload.get('run_id'), 'client_request_id': request.payload.get('client_request_id'),
+                'content': answer_text, 'target_provider': target, 'intent': 'clarification_mention',
+            })
     try:
         run_id = uuid.UUID(request.payload.get('run_id', ''))
     except (ValueError, TypeError, AttributeError):
@@ -599,13 +653,15 @@ def confirm_decision_brief(request, conversation_id):
             state['public_search_query'] = search_query
             state['public_search_provider'] = provider
         expected_clarification_calls = state.get('clarification_calls', 1)
-        if (expected_clarification_calls not in (1, 2) or run.calls_used != expected_clarification_calls
+        if (expected_clarification_calls not in (1, 2) or run.calls_used != expected_clarification_calls + state.get('clarification_member_calls', 0)
                 or not AgentStep.objects.filter(run=run, role='clarifier', status='completed').exists()
                 or (expected_clarification_calls == 2 and not AgentStep.objects.filter(run=run, role='clarifier_peer', status='completed').exists())):
             return JsonResponse({'error': '本轮执行记录不完整，不能自动继续。'}, status=409)
         # Freeze messages that arrived while the clarification was being made.
         context = list(run.input_context)
-        for item in run.interjections.filter(status='pending'):
+        from .clarification_mentions import cancel_mentions
+        cancel_mentions(run)
+        for item in run.interjections.filter(status__in=['pending', 'answered', 'mention_failed', 'mention_cancelled']):
             if item.content.startswith('引用第 '):
                 from .report_followups import resolve_report
                 report = resolve_report(conversation, item.content)
@@ -764,9 +820,7 @@ def _execute_team_run(run, *, context=None, connections=None):
                 public.append(entry)
             discussion.append({'member': '用户', 'content': content, 'target_provider': item.target_provider})
             if item.target_provider:
-                connection = next((c for c in connections.values() if c.provider == item.target_provider), None)
-                if connection is None:
-                    raise RunStopped('指定成员已不可用；消息已保留，请在下一轮继续。')
+                connection = member_connection(connections, item.target_provider, run.decision_state.get('participants'))
                 with transaction.atomic():
                     lock_conversation(request.user, conversation_id)
                     check_active()
@@ -905,8 +959,32 @@ def _execute_team_run(run, *, context=None, connections=None):
             from .decision_team_engine import BRIEF_FIELDS, confirm_brief, prepare_brief, peer_clarification, run_decision, quick_member_reply
             state = dict(run.decision_state)
             quick_content = None
-            if state.get('phase') == 'drafting':
-                state['quick_disabled'] = run.interjections.filter(status='pending').exists()
+            if state.get('direct_provider'):
+                target = state['direct_provider']
+                conn = member_connection(connections, target, state['participants'])
+                member = next(p for p in state['participants'] if p['provider'] == target)
+                # Include supplemental messages received before this call. Later
+                # arrivals stay pending for the next explicitly authorized turn.
+                pending = list(run.interjections.filter(status='pending', target_provider__in=('', target)))
+                member_context = list(context)
+                for item in pending:
+                    entry = {'role': 'user', 'content': '【协作过程中的用户发言' +
+                             (f'，指定 {item.target_provider}' if item.target_provider else '') + '】\n' + item.content}
+                    if entry not in member_context:
+                        member_context.append(entry)
+                answer = quick_member_reply(member_context, [], conn, 'quick_' + member['id'], '点名回复',
+                                            before_step, after_step, direct_member=member['label'],
+                                            followup_report=state.get('followup_report'), sources=state.get('sources'))
+                quick_content = f'{member["label"]}：{answer}'
+                state.update(phase='completed', stop_reason='已由指定成员回复。')
+                state.pop('sources', None)
+                synthesis_seen = {i.id for i in pending}
+                with transaction.atomic():
+                    lock_conversation(request.user, conversation_id)
+                    check_active()
+                    TeamRun.objects.filter(pk=run.pk).update(decision_state=state)
+            elif state.get('phase') == 'drafting':
+                state['quick_disabled'] = run.interjections.filter(status='pending', target_provider='').exists()
                 draft = prepare_brief(context, connections, state, before_step, after_step)
                 if draft.get('public_search_query') or draft.get('public_search_requested'):
                     from .public_research import search_provider_name
@@ -940,6 +1018,9 @@ def _execute_team_run(run, *, context=None, connections=None):
                         lock_conversation(request.user, conversation_id)
                         check_active()
                         TeamRun.objects.filter(pk=run.pk, status='running').update(decision_state=state, updated_at=timezone.now())
+                        # This round was classified as chat. The decision stages
+                        # no longer reserve its call budget for unrelated work.
+                        run.steps.filter(status='pending').update(status='skipped')
                     first = connections['synthesizer']
                     replies = [{'member': first.provider_label, 'content': draft['reply']}]
                     seen = {first.fingerprint}
@@ -948,7 +1029,7 @@ def _execute_team_run(run, *, context=None, connections=None):
                         if connection.fingerprint in seen:
                             continue
                         if run.interjections.filter(status='pending').exists():
-                            raise RunStopped('收到新的群聊消息，已保留；请在下一轮继续。')
+                            break
                         seen.add(connection.fingerprint)
                         role = 'quick_' + part['id']
                         with transaction.atomic():
@@ -959,9 +1040,17 @@ def _execute_team_run(run, *, context=None, connections=None):
                         answer = quick_member_reply(context, replies, connection, role, '群聊回复', before_step, after_step,
                                                     followup_report=state.get('followup_report'), sources=state.get('sources'))
                         replies.append({'member': connection.provider_label, 'content': answer})
+                    if run.interjections.filter(status='pending').exists():
+                        if run.interjections.filter(status='pending', target_provider='').exists():
+                            raise RunStopped('收到新的群聊消息，已保留；请在下一轮继续。')
+                        from .team_engine import _public_context
+                        discussion = list(replies)
+                        before_discussion('quick_mentions', _public_context(context), discussion)
+                        replies.extend(item for item in discussion if item.get('role') == '回应用户')
+                        synthesis_seen = set(run.interjections.filter(status='answered').values_list('id', flat=True))
                     quick_content = '\n\n'.join(item['member'] + '：' + item['content'] for item in replies)
                     state['phase'] = 'completed'
-                    state['stop_reason'] = '群聊成员已分别回复。'
+                    state['stop_reason'] = '点名成员已回应。' if synthesis_seen else '群聊成员已分别回复。'
                     state.pop('sources', None)
                     with transaction.atomic():
                         lock_conversation(request.user, conversation_id)
@@ -996,6 +1085,8 @@ def _execute_team_run(run, *, context=None, connections=None):
                         state['waiting_task_updated_at'] = task.updated_at.isoformat()
                         TeamRun.objects.filter(pk=run.pk, status='running').update(
                             status='awaiting_input', decision_state=state, input_context=context, updated_at=now)
+                        # A user can address someone while the clarifiers are still speaking.
+                        run.interjections.filter(status='pending').exclude(target_provider='').update(status='mention_queued')
                         TaskEvent.objects.create(task=task, kind='decision_clarification',
                             content='问题说明和关键补问已生成，请核对后继续；尚未进行独立分析。')
                         run.refresh_from_db()
@@ -1039,6 +1130,7 @@ def _execute_team_run(run, *, context=None, connections=None):
                        run_decision(context, connections, state, before_step, after_step, persist_decision,
                                     before_discussion=before_discussion, prepare_optional=prepare_optional,
                                     skip_optional=skip_optional, skip_step=skip_step,
+                                    allow_extra_round=lambda: TeamRun.objects.filter(pk=run.pk, calls_used__lte=max_calls - 3).exists(),
                                     parallel_analysis=not db_connection.in_atomic_block))
         else:
             content = run_team(context, connections, before_step=before_step, after_step=after_step,
@@ -1051,7 +1143,9 @@ def _execute_team_run(run, *, context=None, connections=None):
         with transaction.atomic():
             lock_conversation(request.user, conversation_id)
             check_active()
-            if set(run.interjections.values_list('id', flat=True)) != synthesis_seen:
+            if run.decision_state.get('direct_provider'):
+                run.interjections.filter(id__in=synthesis_seen, status='pending').update(status='answered')
+            elif set(run.interjections.values_list('id', flat=True)) != synthesis_seen:
                 raise RunStopped('综合草稿后收到新消息，已保留待处理；请在下一轮继续。')
             if mode == 'files':
                 # Verify and save while the active execution claim is present.

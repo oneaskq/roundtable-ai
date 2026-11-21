@@ -15,6 +15,141 @@ from .test_decision_team import connections, fixture
 
 
 class ChatClarificationTests(TestCase):
+    def mention(self, run, *, request_id=None, target='qwen', content='千问呢', guarded=True):
+        body = {'run_id': str(run.id), 'client_request_id': request_id or str(uuid.uuid4()),
+                'content': content, 'target_provider': target}
+        if guarded:
+            body['intent'] = 'clarification_mention'
+        return self.client.post(f'/api/conversations/{self.conversation.id}/team-messages',
+                                 json.dumps(body), content_type='application/json')
+
+    def test_waiting_member_replies_once_without_confirmation_and_real_answer_then_resumes(self):
+        from .team_views import serialize_run
+        run = self.start(peer_question='你能接受多久？')
+        questions = run.decision_state['brief_draft']['questions']
+        request_id = str(uuid.uuid4())
+        self.assertEqual(self.mention(run, request_id=request_id).json()['status'], 'mention_queued')
+        self.assertEqual(self.mention(run, request_id=request_id).status_code, 200)
+
+        def reply(messages, **kwargs):
+            self.assertEqual(kwargs['connection'].provider, 'qwen')
+            packet = json.loads(messages[0]['content'])
+            self.assertEqual(packet['question_to_you'], '千问呢')
+            self.assertEqual(packet['brief']['questions'], questions)
+            # Concurrent workers and repeated submissions may not re-dispatch this claimed call.
+            self.assertIsNone(process_next_run())
+            self.assertEqual(self.mention(run, request_id=request_id).json()['status'], 'mention_running')
+            return json.dumps({'reply': '我会先看你能接受的期限。'})
+
+        with patch('delivery.decision_team_engine.generate_reply', side_effect=reply) as provider:
+            self.assertEqual(process_next_run(), run.id)
+            self.assertIsNone(process_next_run())
+        self.assertEqual(provider.call_count, 1)
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.calls_used), ('awaiting_input', 3))
+        self.assertEqual(run.decision_state['brief_draft']['questions'], questions)
+        self.assertFalse(run.steps.filter(role__startswith='analysis_', status='completed').exists())
+        self.assertTrue(any(turn['provider'] == 'qwen' and turn['content'] == '我会先看你能接受的期限。'
+                            for turn in serialize_run(run)['discussion']))
+        self.assertEqual(self.mention(run, request_id=request_id).json()['status'], 'answered')
+        self.assertEqual(self.answer(run, '优先成本').status_code, 202)
+        self.assertEqual(self.mention(run).status_code, 409)
+        with patch('delivery.decision_team_engine.generate_reply',
+                   side_effect=lambda *a, **kw: json.dumps(fixture(AgentStep.objects.get(status='running').role))):
+            self.assertEqual(process_next_run(), run.id)
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.calls_used), ('completed', 13))
+
+    def test_member_addressed_during_clarifier_is_picked_up_once_it_pauses(self):
+        def early_mention():
+            self.assertEqual(self.mention(TeamRun.objects.get(), guarded=False).json()['status'], 'pending')
+        run = self.start(on_peer=early_mention)
+        self.assertEqual(run.interjections.get().status, 'mention_queued')
+        with patch('delivery.decision_team_engine.generate_reply', return_value='{"reply":"我在。"}') as provider:
+            process_next_run()
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(provider.call_args.kwargs['connection'].provider, 'qwen')
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.interjections.get().status), ('awaiting_input', 'answered'))
+
+    def test_mention_reserves_the_remaining_work_and_an_hourly_denial_is_not_charged(self):
+        from .models import RequestBudget
+        run = self.start()
+        self.assertEqual(self.mention(run).status_code, 201)
+        self.assertEqual(self.mention(run).status_code, 201)
+        self.assertEqual(self.mention(run).status_code, 429)
+        RequestBudget.objects.filter(user=self.user).update(attempts=RequestBudget.HOURLY_LIMIT)
+        with patch('delivery.decision_team_engine.generate_reply') as provider:
+            process_next_run()
+            process_next_run()
+            provider.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.calls_used, 2)
+        self.assertEqual(run.interjections.filter(status='mention_failed').count(), 2)
+        self.assertEqual(self.answer(run, '按预算比较').status_code, 202)
+
+    def test_clarification_answer_cancels_late_mention_but_preserves_user_input(self):
+        run = self.start()
+        self.mention(run, content='@千问 帮我考虑维护成本')
+        def concurrent_answer(*args, **kwargs):
+            self.assertEqual(self.answer(run, '预算优先').status_code, 202)
+            return '{"reply":"迟到的结果"}'
+        with patch('delivery.decision_team_engine.generate_reply', side_effect=concurrent_answer):
+            process_next_run()
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.calls_used), ('queued', 3))
+        self.assertEqual(run.interjections.get(target_provider='qwen').status, 'mention_cancelled')
+        self.assertFalse(run.steps.filter(output__contains='迟到的结果').exists())
+        self.assertTrue(any('维护成本' in m['content'] for m in run.input_context))
+
+    def test_waiting_mention_rejects_nonparticipant_and_foreign_owner(self):
+        run = self.start()
+        run.decision_state['participants'] = run.decision_state['participants'][:2]
+        run.save(update_fields=['decision_state'])
+        self.assertIn(self.mention(run).status_code, (400, 409))
+        other = get_user_model().objects.create_user(email='mention-other@example.test', password='ExamplePass123!')
+        self.client.force_login(other)
+        self.assertEqual(self.mention(run).status_code, 404)
+        self.assertFalse(run.interjections.exists())
+
+    def test_pause_during_the_addressed_call_discards_reply(self):
+        run = self.start()
+        self.mention(run)
+
+        def pause(*args, **kwargs):
+            result = self.client.post(f'/api/tasks/{self.task.id}/transition', json.dumps({'action': 'pause'}),
+                                      content_type='application/json')
+            self.assertEqual(result.status_code, 200)
+            return '{"reply":"已经暂停"}'
+
+        with patch('delivery.decision_team_engine.generate_reply', side_effect=pause) as provider:
+            process_next_run()
+            self.assertIsNone(process_next_run())
+        run.refresh_from_db()
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual((run.status, run.calls_used), ('paused', 3))
+        self.assertEqual(run.interjections.get().status, 'mention_cancelled')
+        self.assertFalse(run.steps.filter(output__contains='已经暂停').exists())
+
+    def test_abandoned_claim_is_failed_without_replay_or_losing_the_questions(self):
+        from django.utils import timezone
+        run = self.start()
+        self.mention(run)
+        def crash(*args, **kwargs):
+            raise RuntimeError('模拟 worker 退出')
+        with patch('delivery.decision_team_engine.generate_reply', side_effect=crash):
+            with self.assertRaises(RuntimeError):
+                process_next_run()
+        stale = timezone.now() - timezone.timedelta(minutes=11)
+        run.interjections.update(created_at=stale)
+        run.steps.filter(role__startswith='mention_').update(updated_at=stale)
+        with patch('delivery.decision_team_engine.generate_reply') as provider:
+            self.assertIsNone(process_next_run())
+            provider.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.interjections.get().status, run.calls_used), ('awaiting_input', 'mention_failed', 3))
+        self.assertEqual(self.answer(run, '预算优先').status_code, 202)
+
     def setUp(self):
         self.user = get_user_model().objects.create_user(email='clarify@example.test', password='ExamplePass123!')
         self.client.force_login(self.user)

@@ -29,19 +29,84 @@ class QuickChatTests(TestCase):
         self.addCleanup(self.team_patch.stop)
         self.addCleanup(self.summary_patch.stop)
 
-    def start(self, content):
+    def start(self, content, *, calls=14, count=None, expected_status=202):
         self.message.content = content
         self.message.save(update_fields=['content'])
         self.task.goal = content
         self.task.save()
         body = {'background': True, 'client_request_id': str(uuid.uuid4()), 'confirm_cost': True,
                 'expected_team': self.revision, 'workflow': 'decision_v1', 'delivery_mode': 'text',
-                'expected_max_calls': 14, 'expected_task': str(self.task.id),
+                'expected_max_calls': calls, 'expected_task': str(self.task.id),
                 'expected_task_updated_at': self.task.updated_at.isoformat(),
                 'expected_sources': sources_revision(SourceMaterial.objects.filter(conversation=self.conversation))}
+        if count:
+            body['participant_count'] = count
         result = self.client.post(f'/api/conversations/{self.conversation.id}/collaborate',
                                   json.dumps(body), content_type='application/json')
-        self.assertEqual(result.status_code, 202, result.content)
+        self.assertEqual(result.status_code, expected_status, result.content)
+
+    def test_address_syntax_is_narrow_and_group_requests_are_preserved(self):
+        from .member_address import addressed_provider
+        for text, provider in [('千问呢？', 'qwen'), ('那 Kimi 呢', 'kimi'),
+                               ('@DeepSeek 你怎么看？', 'deepseek'), ('Kimi，你觉得可行吗？', 'kimi')]:
+            self.assertEqual(addressed_provider(text), provider, text)
+        for text in ['千问的接口价格是多少', 'Kimi 和千问呢？', 'Kimi.ai 靠谱吗', 'https://example.org/@Kimi',
+                     'a@kimi.example', '@Kimi 请整个团队一起分析', '@Kimi @千问 你们怎么看', '资料里写着千问呢']:
+            self.assertEqual(addressed_provider(text), '', text)
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_direct_member_round_calls_only_named_provider_with_prior_visible_history(self, generate):
+        Message.objects.create(conversation=self.conversation, role='assistant', content='DeepSeek：方案 A 的通勤更长')
+        generate.return_value = '{"reply":"如果每周返校，先核对通勤时间。"}'
+        self.start('千问呢？', calls=1)
+        process_next_run()
+        run = TeamRun.objects.get()
+        self.assertEqual((run.status, run.max_calls, run.calls_used), ('completed', 1, 1))
+        self.assertEqual((run.steps.get().provider, run.decision_state['response_kind']), ('qwen', 'direct_member'))
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(generate.call_args.kwargs['connection'].provider, 'qwen')
+        self.assertIn('通勤更长', generate.call_args.args[0][0]['content'])
+        self.assertIn('核对通勤时间', Message.objects.get(pk=run.decision_state['result_message_id']).content)
+
+    def test_direct_address_outside_selected_team_or_one_call_consent_for_full_team_is_rejected(self):
+        self.start('千问呢', count=2, expected_status=409)
+        self.start('请整个团队聊聊', calls=1, expected_status=400)
+        self.assertFalse(TeamRun.objects.exists())
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_direct_member_failure_does_not_fall_back_or_claim_a_reply(self, generate):
+        from .provider import ProviderError
+        generate.side_effect = ProviderError('模拟网络超时')
+        self.start('@Kimi 你怎么看？')
+        process_next_run()
+        run = TeamRun.objects.get()
+        self.assertEqual((run.status, run.calls_used, generate.call_count), ('failed', 1, 1))
+        self.assertEqual(run.steps.get().provider, 'kimi')
+        self.assertFalse(Message.objects.filter(conversation=self.conversation, role='assistant').exists())
+
+    @patch('delivery.team_views.generate_reply')
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_named_followup_during_quick_group_goes_to_requested_member_only(self, first, target):
+        def posted(messages, **kwargs):
+            step = AgentStep.objects.get(status='running')
+            payload = {'run_id': str(step.run_id), 'content': '千问呢？', 'client_request_id': str(uuid.uuid4())}
+            endpoint = f'/api/conversations/{self.conversation.id}/team-messages'
+            for status in (201, 200):
+                response = self.client.post(endpoint, json.dumps(payload), content_type='application/json')
+                self.assertEqual(response.status_code, status, response.content)
+            return '{"mode":"quick","quick_reply":"先听大家意见。"}'
+        first.side_effect = posted
+        target.return_value = '我的看法是先明确时间。'
+        self.start('hello')
+        process_next_run()
+        run = TeamRun.objects.get()
+        self.assertEqual((run.status, run.calls_used), ('completed', 2))
+        self.assertEqual(first.call_count, 1)
+        self.assertEqual(target.call_count, 1)
+        self.assertEqual(target.call_args.kwargs['connection'].provider, 'qwen')
+        mention = run.interjections.get()
+        self.assertEqual((mention.status, mention.target_provider), ('answered', 'qwen'))
+        self.assertFalse(run.steps.filter(provider='kimi', status='completed').exists())
 
     def assert_quick_result(self, content, answer, generate):
         def generate_member(messages, **kwargs):

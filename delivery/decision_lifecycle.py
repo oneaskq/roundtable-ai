@@ -9,6 +9,8 @@ def invalidate_waiting_decisions(conversation, owner, reason, *, status='failed'
     runs = TeamRun.objects.filter(task__conversation=conversation, task__owner=owner,
                                   workflow='decision_v1', status='awaiting_input')
     for run in runs:
+        from .clarification_mentions import cancel_mentions
+        cancel_mentions(run)
         state = dict(run.decision_state)
         state.pop('sources', None)
         state['phase'] = status

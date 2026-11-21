@@ -8,7 +8,7 @@
   <meta name="theme-color" content="#ffffff">
   <meta name="referrer" content="no-referrer">
   <title>圆桌 · 把目标交给团队</title>
-  <link rel="stylesheet" href="{% static 'app.css' %}?v=0.20-discussion">
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=0.22-member-replies">
   <link rel="icon" type="image/svg+xml" href="{% static 'favicon.svg' %}">
   <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=1">
   <script src="{% static 'report-followup.js' %}?v=1" defer></script>
@@ -16,8 +16,9 @@
   <script src="{% static 'sources.js' %}?v=0.20-first-message" defer></script>
   <script src="{% static 'quality.js' %}?v=0.9.0" defer></script>
   <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=1">
-  <script src="{% static 'discussion-timing.js' %}?v=1" defer></script>
-  <script src="{% static 'app.js' %}?v=0.21-discussion" defer></script>
+  <script src="{% static 'discussion-timing.js' %}?v=2" defer></script>
+  <script src="{% static 'discussion-presentation.js' %}?v=1" defer></script>
+  <script src="{% static 'app.js' %}?v=0.22-member-replies" defer></script>
 </head>
 <body>
   <div class="csrf-holder" hidden>{% csrf_token %}</div>
@@ -102,7 +103,13 @@
           <small id="lookup-note">确认后，仅将框内关键词发给检索服务，并读取公开来源。</small>
           <button type="button" class="button" id="lookup-continue">查资料并继续</button>
         </section>
-        <section id="team-progress" class="team-progress" aria-label="团队协作进度" hidden><p id="team-progress-text" class="team-progress-text" role="status" aria-live="polite"></p><small id="discussion-time" aria-live="off" hidden></small></section>
+        <section id="team-progress" class="team-progress" aria-label="团队协作进度" hidden>
+          <div class="team-wait-line">
+            <span id="team-wait-mark" class="team-wait-mark" aria-hidden="true" hidden><i></i><i></i><i></i></span>
+            <p id="team-progress-text" class="team-progress-text" role="status" aria-live="polite" aria-atomic="true"></p>
+          </div>
+          <small id="discussion-time" aria-live="off" hidden></small>
+        </section>
         <div id="task-controls" class="task-controls" hidden><button id="pause-task" class="text-button">暂停任务</button></div>
         
         </div></div>

@@ -16,7 +16,8 @@ HEARTBEAT_SECONDS = 20
 
 
 def _resuming_decision(run):
-    return (run.workflow == 'decision_v1' and run.calls_used == run.decision_state.get('clarification_calls', 1)
+    return (run.workflow == 'decision_v1' and run.calls_used == (
+                run.decision_state.get('clarification_calls', 1) + run.decision_state.get('clarification_member_calls', 0))
             and run.decision_state.get('phase') == 'confirmed'
             and bool(run.decision_state.get('brief')))
 
@@ -154,6 +155,7 @@ def process_next_run():
     from .team_views import execute_team_run
     run = claim_next_run()
     if run is None:
-        return None
+        from .clarification_mentions import process_waiting_mention
+        return process_waiting_mention()
     execute_team_run(run)
     return run.id

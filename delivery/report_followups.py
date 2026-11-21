@@ -67,7 +67,7 @@ def resolve_report(conversation, question, *, selected_sources=None):
                                   task__superseded_by_message__isnull=True, workflow='decision_v1', status='completed')
     if ordinal or re.search(r'(?:报告|上一轮的?结论)', prompt):
         ids = [mid for mid, kind in runs.values_list('decision_state__result_message_id', 'decision_state__response_kind')
-               if mid and kind not in ('quick', 'quick_group')]
+               if mid and kind not in ('quick', 'quick_group', 'direct_member')]
         messages = messages.filter(id__in=ids).order_by('created_at', 'id')
         message = messages[ordinal - 1:ordinal].first() if ordinal else messages.last()
     else:
@@ -75,12 +75,12 @@ def resolve_report(conversation, question, *, selected_sources=None):
     saved = (runs.filter(decision_state__result_message_id=str(message.id))
              .values('decision_state', 'source_snapshot').first() if message else None)
     state = saved['decision_state'] if saved else {}
-    if state.get('response_kind') in ('quick', 'quick_group') and state.get('followup_source_message_id'):
+    if state.get('response_kind') in ('quick', 'quick_group', 'direct_member') and state.get('followup_source_message_id'):
         message = messages.filter(pk=state['followup_source_message_id']).first()
         saved = (runs.filter(decision_state__result_message_id=str(message.id))
                  .values('decision_state', 'source_snapshot').first() if message else None)
         state = saved['decision_state'] if saved else {}
-    if not state or state.get('response_kind') in ('quick', 'quick_group'):
+    if not state or state.get('response_kind') in ('quick', 'quick_group', 'direct_member'):
         return ({'user_selected_text': excerpt[:2000], 'notice': '用户引述的历史文字，无法定位对应报告，未经核实。'}
                 if ordinal else None)
     # Prior IDs live only in this quote. The current round verifies its own sources and evidence.

@@ -13,7 +13,7 @@
   }
   function metrics(run) {
     if (run?.workflow !== "decision_v1") return [];
-    const quick = ["quick", "quick_group"].includes(run.decision?.response_kind);
+    const quick = ["quick", "quick_group", "direct_member"].includes(run.decision?.response_kind);
     const first = (run.discussion || []).filter(item => item.kind === "assistant" && item.content &&
       (item.role.startsWith("analysis_") || (quick && (item.role === "clarifier" || item.role.startsWith("quick_")))))
       .map(item => time(item.created_at)).filter(Number.isFinite).sort((a,b) => a-b)[0];

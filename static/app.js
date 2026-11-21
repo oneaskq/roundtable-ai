@@ -659,6 +659,7 @@ function renderReplyFeedback() {
   $("#refresh-conversation").disabled = Boolean(state.activeSave);
 }
 function stopReplyWaiting(reason) {
+  if (state.memberMonitor) { clearReplyMonitoring(state.memberMonitor); state.memberMonitor = null; }
   const request = state.activeReply; if (!request) return;
   state.activeReply = null; clearReplyMonitoring(request);
   if (reason === "pause") state.replyFeedback[request.conversationId] = { text: "本轮已停止。已发出的调用可能仍计费，迟到结果不会写入。" };
@@ -669,15 +670,23 @@ function clearReplyMonitoring(request) {
   clearTimeout(request.timeout); clearTimeout(request.pollTimer); clearTimeout(request.pollTimeout);
   request.pollController?.abort();
 }
+function memberReplyPending(run) {
+  return run?.status === "awaiting_input" && (run.discussion || []).some(item =>
+    item.kind === "user" && ["mention_queued", "mention_running"].includes(item.status));
+}
+function monitoringCurrent(request) {
+  return !request.monitoringStopped && replyContextCurrent(request) &&
+    (request.memberOnly ? state.memberMonitor === request : state.activeReply === request);
+}
 function scheduleReplyPoll(request) {
   clearTimeout(request.pollTimer);
   const run = currentTask()?.runs?.[0];
   const waitingForFirstReply = run?.workflow === "decision_v1" &&
     !(run.discussion || []).some(item => item.kind === "assistant" && item.content);
   const finishing = (run?.steps || []).some(step => step.role === "synthesizer" && step.status === "running");
-  const interval = waitingForFirstReply || finishing ? 650 : 1500;
+  const interval = request.memberOnly || waitingForFirstReply || finishing || run?.decision?.response_kind === "direct_member" ? 450 : 1000;
   request.pollTimer = setTimeout(async () => {
-    if (request.monitoringStopped || state.activeReply !== request || !replyContextCurrent(request)) return;
+    if (!monitoringCurrent(request)) return;
     const revision = state.conversationRevision;
     request.pollController = new AbortController();
     request.pollTimeout = setTimeout(() => request.pollController?.abort(), 10000);
@@ -685,23 +694,24 @@ function scheduleReplyPoll(request) {
       let version = null;
       if (request.runId) {
         const progress = await api(`/api/conversations/${encodeURIComponent(request.conversationId)}/runs/${encodeURIComponent(request.runId)}/status`, { signal: request.pollController.signal });
-        if (request.monitoringStopped || state.activeReply !== request || !replyContextCurrent(request) || revision !== state.conversationRevision) return;
+        if (!monitoringCurrent(request) || revision !== state.conversationRevision) return;
         version = progress.version;
-        if (version && version === request.progressVersion && progress.task_status === "running") {
+        if (version && version === request.progressVersion && (request.memberOnly || progress.task_status === "running")) {
           request.pollFailures = 0;
           if (state.replyFeedback[request.conversationId]?.pollError) { delete state.replyFeedback[request.conversationId]; renderReplyFeedback(); }
           return;
         }
       }
       const data = await api(`/api/conversations/${encodeURIComponent(request.conversationId)}`, { signal: request.pollController.signal });
-      if (request.monitoringStopped || state.activeReply !== request || !replyContextCurrent(request) || revision !== state.conversationRevision) return;
+      if (!monitoringCurrent(request) || revision !== state.conversationRevision) return;
       state.conversation = data.conversation; state.messages = data.messages || []; state.tasks = data.tasks || [];
       request.progressVersion = version;
       request.pollFailures = 0;
       if (state.replyFeedback[request.conversationId]?.pollError) delete state.replyFeedback[request.conversationId];
-      if (currentTask()?.status !== "running") {
-        clearReplyMonitoring(request); state.activeReply = null;
-        renderChat(true); renderConversationList();
+      if (request.memberOnly ? !memberReplyPending(currentTask()?.runs?.[0]) : currentTask()?.status !== "running") {
+        clearReplyMonitoring(request);
+        if (request.memberOnly) state.memberMonitor = null; else state.activeReply = null;
+        renderChat(true); renderConversationList(); resumeReplyMonitoring();
         if (!$("#artifacts-panel").hidden) await loadConversationArtifacts();
         void refreshWorkspace().catch(() => {});
         void refreshCapabilities().catch(() => {});
@@ -709,7 +719,7 @@ function scheduleReplyPoll(request) {
       }
       renderChat(true);
     } catch {
-      if (request.monitoringStopped || state.activeReply !== request || !replyContextCurrent(request)) return;
+      if (!monitoringCurrent(request)) return;
       request.pollFailures = (request.pollFailures || 0) + 1;
       if (request.pollFailures >= 2) {
         state.replyFeedback[request.conversationId] = { text: "进度连接暂时中断，正在重连。不会重复提交任务。", error: true, pollError: true };
@@ -718,14 +728,24 @@ function scheduleReplyPoll(request) {
     }
     finally {
       clearTimeout(request.pollTimeout);
-      if (!request.monitoringStopped && state.activeReply === request && replyContextCurrent(request)) scheduleReplyPoll(request);
+      if (monitoringCurrent(request)) scheduleReplyPoll(request);
     }
   }, Math.min(10000, interval * (1 + (request.pollFailures || 0))));
 }
 function resumeReplyMonitoring() {
-  if (state.view !== "roundtable" || !state.conversation || state.activeReply || currentTask()?.status !== "running") return;
-  const request = {conversationId: state.conversation.id, taskId: currentTask().id, runId: currentTask().runs?.[0]?.id, viewVersion: state.viewVersion, authVersion: state.authVersion, controller: new AbortController(), submitted: true};
-  state.activeReply = request; scheduleReplyPoll(request); renderModelControls();
+  if (state.view !== "roundtable" || !state.conversation || state.activeReply) return;
+  const task = currentTask();
+  const latest = task?.runs?.[0];
+  const memberOnly = memberReplyPending(latest);
+  if (state.memberMonitor) {
+    if (memberOnly && state.memberMonitor.runId === latest.id) return;
+    clearReplyMonitoring(state.memberMonitor); state.memberMonitor = null;
+  }
+  if (!memberOnly && task?.status !== "running") return;
+  const request = {conversationId: state.conversation.id, taskId: task.id, runId: latest?.id,
+    viewVersion: state.viewVersion, authVersion: state.authVersion, controller: new AbortController(), submitted: true, memberOnly};
+  if (memberOnly) state.memberMonitor = request; else state.activeReply = request;
+  scheduleReplyPoll(request); renderModelControls();
 }
 function replyContextCurrent(request) {
   return state.user && request.authVersion === state.authVersion && request.viewVersion === state.viewVersion && state.view === "roundtable" && state.conversation?.id === request.conversationId;
@@ -743,11 +763,13 @@ async function submitClarification(answer, previous = null, search = null) {
   if (!conversationId || !run || (!previous && (run.status !== "awaiting_input" || state.activeReply)) || state.activeSave) return;
   if (answer.length > 2000) { showToast("补充回答最多 2000 字。", true); return; }
   const operation = {version: state.viewVersion, authVersion: state.authVersion, conversationId};
-  if (answer) saveInterjectionDraft(conversationId, {kind: "clarification", runId: run.id, text: answer, maxCalls: run.max_calls, search});
+  const saved = interjectionDraft(conversationId);
+  const receipt = answer ? (saved?.kind === "clarification" && saved.runId === run.id && saved.text === answer && saved.receipt || crypto.randomUUID()) : null;
+  if (answer) saveInterjectionDraft(conversationId, {kind: "clarification", runId: run.id, text: answer, maxCalls: run.max_calls, search, receipt});
   state.activeSave = operation; state.conversationRevision++; renderModelControls();
   try {
     await api(`/api/conversations/${encodeURIComponent(conversationId)}/confirm-decision`, {method: "POST", signal: AbortSignal.timeout?.(30000),
-      body: {run_id: run.id, answer, confirm_continue: true, expected_max_calls: run.max_calls,
+      body: {run_id: run.id, answer, confirm_continue: true, expected_max_calls: run.max_calls, ...(receipt ? {client_request_id: receipt} : {}),
         ...(search ? {public_search_query: search.query, public_search_provider: search.provider, public_search_consent: true} : {})}});
     if (operation.authVersion !== state.authVersion) return;
     if (answer && interjectionDraft(conversationId)?.kind === "clarification" && interjectionDraft(conversationId)?.text === answer) {
@@ -766,7 +788,7 @@ async function submitClarification(answer, previous = null, search = null) {
     if (operation.authVersion !== state.authVersion || operation.version !== state.viewVersion || state.conversation?.id !== conversationId) return;
     const stale = ["brief_stale", "sources_changed", "team_changed", "acceptance_changed"].includes(error.code);
     if (stale && interjectionDraft(conversationId)?.kind === "clarification") saveInterjectionDraft(conversationId, null);
-    state.replyFeedback[conversationId] = {text: stale ? "需求或配置已改变，请重新整理问题。" : "回复状态暂未确认；可用相同内容重试或刷新查看，不会重复开始本轮。", error: true, briefStale: stale};
+    state.replyFeedback[conversationId] = {text: stale ? "需求或配置已改变，请重新整理问题。" : error.status >= 400 && error.status < 500 ? error.message : "回复状态暂未确认；可用相同内容重试或刷新查看，不会重复开始本轮。", error: true, briefStale: stale};
     renderReplyFeedback();
   } finally {
     if (state.activeSave === operation) state.activeSave = null;
@@ -956,7 +978,7 @@ function renderChat(preserveArtifacts = false) {
   const existingMessageIds = new Set([...$("#messages").querySelectorAll("[data-message]")].map(node => node.dataset.message));
   if (!switched && follow && !state.reportScrollTarget) {
     const report = runsForChat.find(run => run.workflow === "decision_v1" && run.status === "completed"
-      && !["quick", "quick_group"].includes(run.decision?.response_kind)
+      && !["quick", "quick_group", "direct_member"].includes(run.decision?.response_kind)
       && run.decision?.result_message_id && !existingMessageIds.has(run.decision.result_message_id)
       && state.messages.some(message => message.id === run.decision.result_message_id && !message.superseded_by));
     if (report) state.reportScrollTarget = {conversationId: state.conversation?.id, messageId: report.decision.result_message_id};
@@ -970,7 +992,7 @@ function renderChat(preserveArtifacts = false) {
     const activeMessages = state.messages.filter(message => !message.superseded_by);
     const messages = activeMessages.map((message) => {
       const resultRun = runsForChat.find(run => run.workflow === 'decision_v1' && run.decision?.result_message_id === message.id);
-      if (resultRun?.decision?.response_kind === 'quick_group') return null;
+      if (['quick_group', 'direct_member'].includes(resultRun?.decision?.response_kind)) return null;
       const report = message.role === "assistant" && resultRun && resultRun.decision?.response_kind !== "quick" ? resultRun : null;
       const content = el("div", {class: report ? "message-content report-content" : "message-content"});
       if (message.role === "assistant" && window.RoundtableMessage) content.append(window.RoundtableMessage.render(message.content || "", report?.decision));
@@ -1015,7 +1037,14 @@ function renderChat(preserveArtifacts = false) {
       }
     }
     timeline.sort((a, b) => String(a.time).localeCompare(String(b.time)) || a.order - b.order);
-    $("#messages").replaceChildren(...(history ? [history] : []), ...renderDiscussionTimeline(timeline));
+    const container = $("#messages");
+    const expanded = new Set(switched ? [] : [...container.querySelectorAll("details[data-analysis-key][open]")].map(node => node.dataset.analysisKey));
+    const focusKey = !switched && document.activeElement?.closest("summary")?.parentElement?.dataset.analysisKey;
+    container.replaceChildren(...(history ? [history] : []), ...renderDiscussionTimeline(timeline));
+    for (const detail of container.querySelectorAll("details[data-analysis-key]")) {
+      if (expanded.has(detail.dataset.analysisKey)) detail.open = true;
+      if (focusKey === detail.dataset.analysisKey) detail.querySelector("summary").focus({preventScroll: true});
+    }
   }
   $("#task-status").textContent = taskLabel(task); $("#task-controls").hidden = !task;
   $("#pause-task").hidden = !task || (!["paused", "running"].includes(task.status) && task.runs?.[0]?.status !== "awaiting_input");
@@ -1145,12 +1174,24 @@ function teamChatMessage(item, run, stage = null, members = [item]) {
   const subtitle = [label, speakers.length === 1 && speakers[0].assignment?.label].filter(Boolean).join(" · ");
   const target = isUser && item.target_provider ? `@${providerName(item.target_provider)}` : "";
   const text = el("div", { class: "team-chat-bubble" });
-  if (target) text.append(el("span", { class: "team-chat-mention", text: target + " " }));
-  if (!isUser && window.RoundtableMessage) text.append(window.RoundtableMessage.render(item.content || ""));
-  else text.append(document.createTextNode(item.content || ""));
+  const address = (item.content || "").trimStart().replace(/^[@＠]\s*/, "").toLowerCase();
+  if (target && ![target.slice(1), item.target_provider].some(name => address.startsWith(name.toLowerCase()))) {
+    text.append(el("span", { class: "team-chat-mention", text: target + " " }));
+  }
+  const original = !isUser && window.RoundtableMessage ? window.RoundtableMessage.render(item.content || "") : document.createTextNode(item.content || "");
+  const excerpts = window.RoundtableDiscussion?.analysisPreview(item, run);
+  if (excerpts) {
+    text.append(el("ul", {class: "analysis-excerpts", "aria-label": "分析摘录"}, excerpts.map(value => el("li", {text: value}))));
+    const analysisKey = JSON.stringify([run.id, item.id || item.role, item.provider, item.created_at]);
+    text.append(el("details", {class: "full-analysis", dataset: {analysisKey}}, [
+      el("summary", {text: "完整分析"}),
+      el("div", {class: "analysis-original"}, [original]),
+    ]));
+  } else text.append(original);
   const copy = el("button", {type:"button", class:"message-action", title:"复制", "aria-label":"复制回复"}, [messageIcon("copy")]);
   copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(item.content || ""); showToast("已复制"); } catch { showToast("复制失败，请选中文字复制。", true); } });
-  const status = !isUser ? "" : item.status === "pending" ? (["queued", "running", "awaiting_input"].includes(run.status) ? "等待后续讨论采用" : "本轮未处理，已留给下一轮") : item.status === "included" ? "已纳入讨论" : item.status === "answered" ? "成员已回应" : "";
+  const receipts = {included: "已纳入讨论", answered: "成员已回应", mention_failed: "点名回复未完成，你的消息已保留。"};
+  const status = !isUser ? "" : item.status === "pending" ? (["queued", "running", "awaiting_input"].includes(run.status) ? "等待后续讨论采用" : "本轮未处理，已留给下一轮") : receipts[item.status] || "";
   return el("article", { class: `team-chat-message${isUser ? " is-user" : ""}` }, [
     teamChatAvatar(item.provider, isUser),
     el("div", { class: "team-chat-message-body" }, [el("div", { class: "team-chat-meta" }, [el("strong", { text: name, title: metadata }), !isUser && subtitle ? el("span", {text:subtitle}) : null]), text, copy, status ? el("small", { class: "team-chat-status", text: status }) : null]),
@@ -1158,7 +1199,7 @@ function teamChatMessage(item, run, stage = null, members = [item]) {
 }
 function teamChatHistory(run) {
   const discussion = Array.isArray(run.discussion) ? run.discussion : null;
-  const items = discussion || (run.steps || []).filter((step) => step.status === "completed" && step.output && step.role !== "planner").map((step) => ({kind: "assistant", provider: step.provider, label: step.label, content: step.output}));
+  const items = discussion || (run.steps || []).filter((step) => step.status === "completed" && step.output && step.role !== "planner").map((step) => ({kind: "assistant", id: step.id, role: step.role, provider: step.provider, label: step.label, content: step.output}));
   return el("div", { class: "team-chat-history", "aria-label": "团队讨论记录" }, items.length
     ? items.filter((item) => item.content).map((item) => teamChatMessage(item, run))
     : [el("p", { class: "team-scope", text: "成员完成发言后会显示在这里。" })]);
@@ -1343,21 +1384,19 @@ function decisionRecord(run, opened) {
   detail.open = opened.has(recordId); return detail;
 }
 function renderTeamProgress(task) {
-  const runs = allTeamRuns(); const latest = runs[0];
+  const runs = allTeamRuns(); const latest = task?.runs?.[0];
   const pending = state.activeReply?.conversationId === state.conversation?.id && Boolean(state.conversation);
-  $("#team-progress").hidden = !runs.length && !pending && !task;
-  const active = (latest?.steps || []).find((step) => step.status === "running");
   const labels = { queued: "已排队", running: "协作中", awaiting_input: "等你回复", completed: "成果已保存", failed: "本轮未完成", paused: "已暂停", needs_review: "核验待修订" };
   $("#live-draft").hidden = true;
   $("#live-draft-content").textContent = "";
   const attempts = latest?.status === "failed" ? (latest.calls_used ? ` · 已记录 ${latest.calls_used} 次调用尝试，可能计费；未自动重试` : " · 没有记录模型调用尝试；未自动重试") : "";
-  const phases = {research: "正在读取公开资料", analysis: "成员正在独立判断", review: "正在核对关键主张", response: "正在回应质疑", synthesis: "正在整理最终建议"};
-  const currentStage = latest?.decision?.phase === "research" ? phases.research : active ? "正在" + (active.label || active.role) : phases[latest?.decision?.phase] || "团队正在讨论";
-  const progress = !latest && pending ? "正在提交…" : latest?.status === "queued" ? "已排队 · 等待后台处理" : latest?.status === "running" ? currentStage : latest?.status === "failed" ? `本轮未完成${attempts}` : "";
-  // Keep the live region quiet unless the actual progress changes.
+  const submitting = pending && !state.activeReply.runId && !state.activeReply.submitted && !["queued", "running"].includes(latest?.status);
+  const wait = window.RoundtableDiscussion.waiting(latest, submitting, providerName);
+  const progress = wait.text || (latest?.status === "failed" ? `本轮未完成${attempts}` : "");
+  $("#team-wait-mark").hidden = !wait.busy;
+  $("#team-progress").hidden = !progress;
   if ($("#team-progress-text").textContent !== progress) $("#team-progress-text").textContent = progress;
   $("#team-progress-text").hidden = !progress;
-  $("#team-progress").hidden = !progress;
   window.RoundtableTiming?.monitor($("#discussion-time"), latest);
   const recordSignature = JSON.stringify(runs.map((run) => ({...run, steps: (run.steps || []).map((step) => step.status === "running" ? {...step, output: ""} : step)})));
   if ($("#team-runs").dataset.signature === recordSignature) return;
@@ -1365,7 +1404,7 @@ function renderTeamProgress(task) {
   const opened = new Set([...$("#team-runs").querySelectorAll("details[open]")].map((node) => node.dataset.record));
   const renderedRuns = runs.map((run, runIndex) => {
     const stepLabels = { pending: "等待处理", running: "处理中", completed: "已完成", failed: "未完成", skipped: "未执行", paused: "已暂停" };
-    const isQuick = run.status === "completed" && ['quick', 'quick_group'].includes(run.decision?.response_kind);
+    const isQuick = run.status === "completed" && ['quick', 'quick_group', 'direct_member'].includes(run.decision?.response_kind);
     const steps = (run.steps || []).filter(step => !isQuick || step.status !== "skipped").map((step, index) => {
       const recordId = `${run.id}-${step.role}-${index}`;
       const detail = el("details", { class: `team-step${step.status === "running" ? " is-running" : ""}`, dataset: { record: recordId } }, [
@@ -1825,7 +1864,11 @@ function promptAIConsent(action) {
   state.consentDraft = {conversationId: state.conversation?.id, version: state.viewVersion,
     text: action === "send" ? $("#message-input").value : null, taskId: currentTask()?.id};
   const count = state.conversation?.included_sources_count || 0;
-  $("#ai-consent-text").textContent = `本次对话、相关成果和成员回复${count ? `，以及所选 ${count} 份材料的文字与出处` : ""}将发给 ${modelName()}。每轮最多调用 ${deliveryLimit()} 次，使用已配置账号的额度，可能产生费用。`;
+  const materials = count ? `，以及所选 ${count} 份材料的文字与出处` : "";
+  const cost = state.deliveryMode === "text"
+    ? `单独点名时只由该成员回复，调用 1 次；全队讨论最多调用 ${deliveryLimit()} 次。`
+    : `每轮最多调用 ${deliveryLimit()} 次。`;
+  $("#ai-consent-text").textContent = `参与的模型将收到本次对话、相关成果和成员回复${materials}。可用成员：${modelName()}。${cost}使用已配置账号的额度，可能产生费用。`;
   $("#ai-consent-save").hidden = action !== "send";
   $("#ai-consent-confirm").textContent = action === "enable" ? "开启 AI 团队" : "确认并开始讨论";
   $("#ai-consent").hidden = false;

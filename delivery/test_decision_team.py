@@ -289,6 +289,19 @@ class DecisionEngineTests(TestCase):
         self.assertIn('DeepSeek：反对（方案A）；纠正计算后不再支持', result)
 
     @patch('delivery.decision_team_engine.generate_reply')
+    def test_important_new_evidence_survives_when_remaining_budget_is_reserved_for_synthesis(self, generate):
+        generate.side_effect = lambda *a, **kw: json.dumps(fixture(self.stage, extra=True), ensure_ascii=False)
+        self.prepared()
+        skipped = []
+        result = run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None,
+                              allow_extra_round=lambda: False, skip_optional=lambda: skipped.append(True))
+        self.assertEqual(skipped, [True])
+        self.assertNotIn('extra_review', self.calls)
+        self.assertEqual(self.calls[-1], 'synthesizer')
+        self.assertIn('重要新依据仍待追加核验', result)
+        self.assertEqual(self.state['phase'], 'completed')
+
+    @patch('delivery.decision_team_engine.generate_reply')
     def test_only_one_extra_round_for_traceable_important_new_evidence(self, generate):
         generate.side_effect = lambda messages, **kwargs: json.dumps(fixture(self.stage, extra=True), ensure_ascii=False)
         self.prepared()

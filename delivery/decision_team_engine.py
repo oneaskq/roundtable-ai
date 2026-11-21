@@ -326,7 +326,7 @@ def peer_clarification(context, connections, state, draft, peer, before_step, af
     return question
 
 
-def quick_member_reply(context, prior, connection, role, label, before_step, after_step, *, followup_report=None, sources=None):
+def quick_member_reply(context, prior, connection, role, label, before_step, after_step, *, followup_report=None, sources=None, direct_member=None):
     prompt = '''你是群聊中的一位 AI 成员。自然、简短地回应用户最后一条消息；不要介绍职责或套模板。
 可以参考群里已出现的回复，但独立回答，不冒充其他成员。不要声称执行了不可用的工具。
 只输出 JSON 对象 {"reply":"你的回复"}。'''
@@ -334,12 +334,14 @@ def quick_member_reply(context, prior, connection, role, label, before_step, aft
         value = _parse(output, label)
         _text(value.get('reply', ''), '群聊回复', 2000, required=True)
         after_step(stage, output)
-    packet = {'conversation': _decision_conversation(context) if followup_report else _public_context(context),
+    packet = {'conversation': _decision_conversation(context) if followup_report and not direct_member else _public_context(context),
               'discussion': prior}
     if followup_report:
         packet['followup_report'] = followup_report
         packet['sources'] = sources or []
         prompt += ' 用户追问旧报告时，注明本次资料中的具体出处；找不到时说明。'
+    if direct_member:
+        prompt += f' 用户单独向你（{direct_member}）提问。结合此前真实对话直接、简短回答，不代替其他成员发言。'
     value = _call(role, label, connection, packet,
                   prompt, before_step, validated_after)
     return _text(value.get('reply', ''), '群聊回复', 2000, required=True)
@@ -550,7 +552,7 @@ def _final_opinion(value, participant):
 
 def run_decision(context, connections, state, before_step, after_step, persist, *,
                  before_discussion=None, prepare_optional=None, skip_optional=None, skip_step=None,
-                 parallel_analysis=False):
+                 parallel_analysis=False, allow_extra_round=None):
     if state.get('version') != VERSION or state.get('phase') != 'confirmed':
         raise ProviderError('问题说明尚未确认，本轮不能开始独立分析。')
     started = time.monotonic()
@@ -696,7 +698,7 @@ def run_decision(context, connections, state, before_step, after_step, persist, 
         persist(state)
 
     important_new = [r for r in responses if r['important_new_evidence']]
-    if important_new:
+    if important_new and (allow_extra_round is None or allow_extra_round()):
         item = important_new[0]
         target = next(f for f in findings if f['id'] == item['finding_id'])
         author = next(p for p in state['participants'] if p['id'] == item['author'])
@@ -736,6 +738,9 @@ def run_decision(context, connections, state, before_step, after_step, persist, 
             skip_optional()
         state['stop_reason'] = ('已完成一轮交叉核验和必要回应，没有需要追加核验的重要新依据。'
                                 if responses else '已完成一轮交叉核验，未提出需要回应的质疑。')
+        if important_new:
+            state['stop_reason'] = '剩余额度已留给最终建议，重要新依据仍待追加核验。'
+            state['unresolved'].append(state['stop_reason'])
     all_findings = findings + ((state.get('extra_round') or {}).get('reviews') or [])
     for claim in claims.values():
         related = [finding for finding in all_findings if finding['claim_id'] == claim['id']]
