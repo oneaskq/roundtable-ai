@@ -8,17 +8,17 @@
   <meta name="theme-color" content="#ffffff">
   <meta name="referrer" content="no-referrer">
   <title>圆桌 · 把目标交给团队</title>
-  <link rel="stylesheet" href="{% static 'app.css' %}?v=0.22-member-replies">
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=workspace-nav-1">
   <link rel="icon" type="image/svg+xml" href="{% static 'favicon.svg' %}">
-  <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=1">
+  <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=quiet-surfaces-1">
   <script src="{% static 'report-followup.js' %}?v=1" defer></script>
   <script src="{% static 'message-format.js' %}?v=0.20-citations" defer></script>
   <script src="{% static 'sources.js' %}?v=0.20-first-message" defer></script>
-  <script src="{% static 'quality.js' %}?v=0.9.0" defer></script>
-  <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=1">
+  <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=quiet-surfaces-1">
   <script src="{% static 'discussion-timing.js' %}?v=2" defer></script>
   <script src="{% static 'discussion-presentation.js' %}?v=1" defer></script>
-  <script src="{% static 'app.js' %}?v=0.22-member-replies" defer></script>
+  <script src="{% static 'delivery-intent.js' %}?v=1" defer></script>
+  <script src="{% static 'app.js' %}?v=workspace-nav-1" defer></script>
 </head>
 <body>
   <div class="csrf-holder" hidden>{% csrf_token %}</div>
@@ -71,9 +71,6 @@
         <button class="nav-item active" data-view="roundtable"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg> 对话</button>
         <button class="nav-item" data-view="projects"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> 我的项目</button>
         <button class="nav-item" data-view="memories"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v17l-6-4-6 4Z"/></svg> 个人记忆</button>
-        <button class="nav-item" data-view="capabilities"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h16M7 16v-5M12 16V7M17 16V4"/></svg> 能力进展</button>
-        <button class="nav-item" data-view="quality"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg> 质量评估</button>
-        <button id="admin-release-nav" class="nav-item" data-view="release" hidden><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> 上线准备</button>
       </nav>
       <label class="conversation-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><span class="sr-only">搜索对话</span><input id="conversation-search" type="search" placeholder="搜索对话" autocomplete="off" aria-controls="conversation-list"></label>
       <div class="history-heading">最近对话</div>
@@ -87,11 +84,6 @@
         <div id="chat-empty" class="chat-empty">
           <div class="hero-mark"><span class="roundtable-logo" aria-hidden="true"></span></div>
           <h1>今天想讨论什么？</h1>
-          <div class="starter-grid">
-            <button type="button" class="starter" data-prompt="我想学编程做一个小工具。每周能投入五小时，应该自学还是报班？">自学还是报班？</button>
-            <button type="button" class="starter" data-prompt="我们在讨论是否要固定每周两天到办公室。什么情况下这会改善合作，什么情况下会适得其反？">团队需要固定到岗吗？</button>
-            <a class="button" href="{% static 'examples/internship.html' %}" target="_blank" rel="noopener" aria-label="看实习选择示例（在新标签页打开）">看实习选择示例 ↗</a>
-          </div>
         </div>
         <div id="conversation-heading" class="conversation-heading" hidden><h1 id="conversation-title">新对话</h1><span id="task-status" class="status-chip">等待模型接入</span><details id="conversation-menu" class="conversation-menu"><summary aria-label="会话操作" title="会话操作">⋯</summary><div class="conversation-menu-panel"><details id="team-record"><summary>查看协作记录</summary><div id="team-runs"></div><details id="work-log" class="work-log" hidden><summary>工作记录</summary><div id="work-log-list"></div></details></details><button id="artifacts-toggle" class="text-button" aria-expanded="false" aria-controls="artifacts-panel">历史文件</button><div id="artifacts-panel" class="artifacts-panel" hidden><button id="brief-task" class="text-button" type="button">生成需求文件</button><div id="artifacts-list"></div></div><button type="button" id="delete-conversation" class="text-button">删除对话</button></div></details></div>
         <div id="messages" class="messages" aria-live="polite"></div>
@@ -121,17 +113,24 @@
             <label class="sr-only" for="message-input">向圆桌交代目标</label><textarea id="message-input" rows="2" maxlength="12000" placeholder="向圆桌提问，或交代一个目标" aria-describedby="composer-hint composer-count" required></textarea>
             <div class="composer-bottom">
               <button id="sources-open" class="icon-button sources-open" type="button" aria-label="添加材料" aria-haspopup="dialog" aria-controls="sources-dialog" title="添加或查看参考材料" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
-              <details id="composer-options" class="composer-options"><summary aria-label="对话设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span id="composer-options-label">文字回复</span><span class="options-chevron" aria-hidden="true">⌄</span></summary>
+              <details id="composer-options" class="composer-options"><summary aria-label="讨论成员与对话设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span id="composer-options-label">讨论成员</span><span class="options-chevron" aria-hidden="true">⌄</span></summary>
                 <div class="composer-settings">
-                  <div class="delivery-options"><label for="delivery-mode">成果形式</label><select id="delivery-mode" aria-describedby="delivery-mode-note"><option value="text">文字讨论</option><option value="text_adaptive">文字任务（原流程）</option><option value="files">多文件成果</option></select></div>
-                  <p id="delivery-mode-note" class="setting-description">交付文字回复，可下载并继续修改。</p>
-                  <div id="participant-count-control" class="delivery-options"><label for="participant-count">讨论成员数量</label><select id="participant-count" aria-describedby="participant-count-note"><option value="">默认</option><option value="2">2 位</option></select></div>
+                  <fieldset id="participant-count-control" class="participant-picker" aria-describedby="participant-count-note">
+                    <legend>参与讨论的成员</legend>
+                    <div id="participant-options" class="participant-options"></div>
+                    <p id="participant-count-note" class="setting-description">至少选择两位成员。</p>
+                  </fieldset>
                   <div id="team-chat-target-row" class="delivery-options" hidden><label for="team-chat-target">这条补充发给</label><select id="team-chat-target"><option value="">全体成员</option></select></div>
-                  <p id="participant-count-note" class="setting-description">默认使用已配置的不同模型，当前版本最多 3 位；至少需要 2 位。每轮仍按最多 14 次调用确认。</p>
                   <label class="project-selector"><span>所属项目</span><select id="composer-project"><option value="">未归入项目</option></select></label>
-                  <div class="model-toolbar"><label class="ai-switch"><input id="ai-enabled" type="checkbox" disabled aria-describedby="availability-text"><span>使用 AI 团队</span></label></div>
                   <div id="acceptance-controls" class="acceptance-controls" hidden><button type="button" id="acceptance-open" class="text-button" aria-haspopup="dialog" aria-describedby="acceptance-summary">程序验收</button><p id="acceptance-summary">保存需求后可设置验收用例。</p></div>
-                  <details id="connection-help" class="connection-help"><summary>团队与模型</summary><div class="connection-content"><p id="connection-summary">正在读取团队状态。</p><div id="team-members" class="team-members"></div><p id="connection-instructions">请先完成团队中各模型的连接和验收，再刷新状态。</p><p>密钥在本机配置窗口填写。</p><div class="connection-actions"><code>配置模型.cmd</code><button type="button" id="copy-connection-command" class="text-button">复制文件名</button><button type="button" id="refresh-connection" class="text-button">刷新状态</button></div></div></details>
+                  <details id="connection-help" class="connection-help">
+                    <summary>模型连接设置</summary>
+                    <div class="connection-content">
+                      <p id="connection-summary">正在读取团队状态。</p>
+                      <p id="connection-instructions">在本机配置模型连接，完成验收后刷新状态。</p>
+                      <div class="connection-actions"><code>配置模型.cmd</code><button type="button" id="copy-connection-command" class="text-button">复制文件名</button><button type="button" id="refresh-connection" class="text-button">刷新状态</button></div>
+                    </div>
+                  </details>
                 </div>
               </details>
               <span id="composer-count" class="composer-count" aria-live="off">0 / 12000</span>
@@ -144,9 +143,6 @@
       </section>
       <section id="projects-view" class="view content-view" hidden></section>
       <section id="memories-view" class="view content-view" hidden></section>
-      <section id="capabilities-view" class="view content-view" hidden></section>
-      <section id="quality-view" class="view content-view" hidden></section>
-      <section id="release-view" class="view content-view" hidden></section>
       <section id="data-view" class="view content-view" hidden></section>
       <section id="security-view" class="view content-view" hidden></section>
     </main>

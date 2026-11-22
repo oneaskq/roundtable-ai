@@ -1,4 +1,4 @@
-.selection-followup { position:fixed; z-index:40; padding:7px 11px; min-height:34px; border:1px solid #dadada; border-radius:8px; background:#fff; color:#333; font-size:13px; box-shadow:0 2px 9px #0001; }
+.selection-followup { position:fixed; z-index:40; padding:7px 11px; min-height:34px; border:1px solid var(--panel-border); border-radius:12px; background:var(--paper); color:var(--ink); font-size:13px; box-shadow:var(--popover-shadow); }
 .report-followup-picker { max-height:75vh; overflow:auto; }
 .report-followup-option { display:block; width:100%; border:0; border-top:1px solid #eee; background:#fff; text-align:left; padding:12px 4px; line-height:1.6; font-size:14px; overflow-wrap:anywhere; }
 .report-followup-option:hover,.report-followup-option:focus-visible { background:#f5f5f5; }

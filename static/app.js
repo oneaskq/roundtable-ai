@@ -2,7 +2,7 @@
 
 const $ = (selector) => document.querySelector(selector);
 const state = { user: null, auth: null, view: "roundtable", mode: "login", projects: [], conversations: [], conversation: null, messages: [], tasks: [], dialogHandler: null, viewVersion: 0, authVersion: 0, workspaceVersion: 0 };
-Object.assign(state, { capabilities: null, capabilityError: "", capabilityVersion: 0, conversationRevision: 0, aiEnabled: false, aiConsentFor: null, activeReply: null, activeSave: null, replyFeedback: {}, deliveryMode: "text", participantCount: "", artifactVersion: 0 });
+Object.assign(state, { capabilities: null, capabilityError: "", capabilityVersion: 0, conversationRevision: 0, aiConsentFor: null, activeReply: null, activeSave: null, replyFeedback: {}, deliveryMode: "text", participantSelection: null, artifactVersion: 0 });
 state.drafts = new Map();
 state.teamChatDrafts = new Map();
 state.teamChatSending = new Map();
@@ -40,11 +40,10 @@ function captureRecoveryLink() {
   return true;
 }
 captureRecoveryLink();
-const viewNames = { roundtable: "圆桌", projects: "我的项目", memories: "个人记忆", capabilities: "能力进展", quality: "质量评估", data: "数据中心", security: "账号安全", release: "上线准备" };
+const viewNames = { roundtable: "圆桌", projects: "我的项目", memories: "个人记忆", data: "数据中心", security: "账号安全" };
 let toastTimer;
 let afterDialog = null;
 let sourcesUI = null;
-let qualityUI = null;
 let sourcesResetting = false;
 function resetSources() {
   sourcesResetting = true;
@@ -313,28 +312,25 @@ function restoreDraft() {
 }
 function showAuth() {
   resetSources();
-  qualityUI?.reset();
   closeAiConsent(); state.messageSignature = ""; state.messageEdit = null; state.scrollConversation = null;
   closeAcceptanceEditor(); state.acceptanceStatus = null;
   stopReplyWaiting("navigation");
   state.viewVersion++; state.authVersion++; state.workspaceVersion++;
-  state.capabilityVersion++; state.capabilities = null; state.capabilityError = ""; state.aiEnabled = false; state.aiConsentFor = null; state.activeSave = null; state.replyFeedback = {};
-  state.saveOnlyMode = false;
+  state.capabilityVersion++; state.capabilities = null; state.capabilityError = ""; state.aiConsentFor = null; state.activeSave = null; state.replyFeedback = {};
   for (const timer of state.draftTimers.values()) clearTimeout(timer);
   state.draftTimers.clear(); state.draftPending.clear(); state.draftsReady = false;
   draftStatus();
   state.drafts.clear(); if ($("#conversation-search")) $("#conversation-search").value = "";
   state.teamChatDrafts.clear(); state.teamChatSending.clear();
   state.pendingSubmissions.clear();
-  state.deliveryMode = "text"; state.participantCount = ""; state.artifactVersion++; $("#delivery-mode").value = "text";
+  state.deliveryMode = "text"; state.participantSelection = null; state.artifactVersion++;
   state.user = null; state.auth = null; state.conversation = null; state.messages = []; state.tasks = []; state.projects = []; state.conversations = [];
-  $("#admin-release-nav").hidden = true;
   $("#messages").replaceChildren(); $("#conversation-list").replaceChildren(); $("#artifacts-list").replaceChildren(); $("#work-log-list").replaceChildren(); delete $("#work-log-list").dataset.signature;
   $("#live-draft").hidden = true; $("#live-draft-content").textContent = "";
-  $("#team-runs").replaceChildren(); delete $("#team-runs").dataset.signature; $("#team-members").replaceChildren(); $("#team-progress").hidden = true; $("#conversation-menu").open = false; $("#team-record").open = false;
+  $("#team-runs").replaceChildren(); delete $("#team-runs").dataset.signature; $("#participant-options").replaceChildren(); delete $("#participant-options").dataset.signature; $("#team-progress").hidden = true; $("#conversation-menu").open = false; $("#team-record").open = false;
   document.querySelectorAll(".content-view").forEach((view) => view.replaceChildren());
   $("#message-input").value = ""; $("#composer-project").replaceChildren(el("option", { value: "", text: "未归入项目" }));
-  $("#ai-enabled").checked = false; $("#ai-enabled").disabled = true; $("#reply-feedback").hidden = true; $("#connection-help").open = false;
+  $("#reply-feedback").hidden = true; $("#connection-help").open = false;
   closeDialog();
   $("#auth-screen").hidden = false; $("#app-shell").hidden = true; $("#loading-screen").hidden = true;
   $("#auth-password").value = ""; $("#auth-code").value = ""; $("#auth-code-field").hidden = true;
@@ -360,7 +356,13 @@ async function useAuth(data) {
   if (state.user?.id !== data.user?.id) state.drafts.clear();
   state.authVersion++; state.auth = data; state.user = data.user; state.recoveryScope = data.recovery_scope || null;
   if (!data.authenticated) { showAuth(); return; }
-  $("#admin-release-nav").hidden = data.user.role !== "admin";
+  state.participantSelection = null;
+  try {
+    const saved = JSON.parse(localStorage.getItem(`roundtable:participants:${data.user.id}`));
+    if (Array.isArray(saved) && saved.length >= 1 && saved.length <= 3 && saved.every(id => typeof id === "string")) {
+      state.participantSelection = saved;
+    }
+  } catch { /* Member selection also works without browser storage. */ }
   $("#auth-screen").hidden = true; $("#app-shell").hidden = false; $("#loading-screen").hidden = true;
   $("#user-name").textContent = data.user.display_name || "我的账号"; $("#user-email").textContent = data.user.email || "";
   $("#user-avatar").textContent = (data.user.display_name || data.user.email || "你").slice(0, 1).toUpperCase();
@@ -404,14 +406,61 @@ function renderConversationList() {
   }));
 }
 
-function chatAvailable() {
-  const team = state.capabilities?.team;
-  return team?.readiness === "available" && typeof team.revision === "string" && Boolean(team.revision)
-    && (state.deliveryMode !== "text" || team.decision_ready !== false);
+function hasTeamConsent() {
+  return Boolean(state.aiConsentFor) && state.aiConsentFor === modelIdentity();
 }
+function selectedMembers() {
+  const team = state.capabilities?.team;
+  const ids = state.participantSelection ?? team?.default_member_ids ?? [];
+  return (team?.members || []).filter(member => member.ready && ids.includes(member.id));
+}
+function chatAvailable() {
+  return Boolean(state.capabilities?.team?.revision) && selectedMembers().length >= 2;
+}
+function renderParticipantOptions(locked) {
+  const group = $("#participant-options");
+  const team = state.capabilities?.team;
+  const members = team?.members || [];
+  const run = currentTask()?.runs?.[0];
+  const frozen = locked && ["queued", "running", "awaiting_input"].includes(run?.status) && run.decision?.selected_members;
+  const listed = frozen?.length ? frozen : members;
+  const selected = (frozen?.length ? frozen : selectedMembers()).map(member => member.id);
+  const signature = JSON.stringify(listed);
+  if (group.dataset.signature !== signature) {
+    group.replaceChildren(...listed.map(member => el("label", {class: "participant-option"}, [
+      el("input", {type: "checkbox", value: member.id}),
+      el("span", {class: "participant-details"}, [
+        el("strong", {text: providerName(member.provider)}),
+        el("span", {class: "participant-model", text: [member.model, member.ready === false && "待验收"].filter(Boolean).join(" · ")})
+      ])
+    ])));
+    group.dataset.signature = signature;
+  }
+  group.querySelectorAll("input").forEach(input => {
+    input.checked = selected.includes(input.value);
+    input.disabled = locked || !members.find(member => member.id === input.value)?.ready;
+  });
+  $("#participant-count-note").textContent = !members.length
+    ? (team ? "暂无已配置的讨论成员" : state.capabilityError || "正在读取成员…")
+    : locked ? "本轮成员已确定" : `已选 ${selected.length} 位 · 可选 2 至 3 位`;
+}
+$("#participant-options").addEventListener("change", event => {
+  const input = event.target;
+  if (input.type !== "checkbox" || input.disabled) return;
+  const group = event.currentTarget;
+  const ids = Array.from(group.querySelectorAll("input:checked"), item => item.value);
+  if ((!input.checked && ids.length < 2) || ids.length > 3) {
+    input.checked = !input.checked;
+    showToast(ids.length < 2 ? "至少选择两位讨论成员" : "一轮最多选择三位成员");
+    return;
+  }
+  state.participantSelection = ids;
+  try { localStorage.setItem(`roundtable:participants:${state.user.id}`, JSON.stringify(ids)); } catch {}
+  state.aiConsentFor = null; closeAiConsent(); renderModelControls();
+});
 function modelIdentity() {
   const revision = state.capabilities?.team?.revision; const cases = state.conversation?.acceptance_cases || [];
-  return revision ? JSON.stringify([revision, state.deliveryMode === "text" ? "decision_v1" : "adaptive", state.deliveryMode, state.deliveryMode === "text" ? state.participantCount : "", cases,
+  return revision ? JSON.stringify([revision, state.deliveryMode === "text" ? "decision_v1" : "adaptive", state.deliveryMode, selectedMembers().map(member => member.id), cases,
     ...(state.conversation?.sources_count ? [state.conversation.id, state.conversation.sources_revision] : []),
     ...(cases.length ? [state.conversation?.id, currentTask()?.id || null, currentTask()?.goal || ""] : [])]) : "";
 }
@@ -425,26 +474,35 @@ function deliveryLimit(mode = state.deliveryMode) {
 }
 function setDeliveryMode(mode) {
   mode = ["files", "text_adaptive"].includes(mode) ? mode : "text";
-  if (mode !== state.deliveryMode) { state.aiEnabled = false; state.aiConsentFor = null; closeAiConsent(); }
-  state.deliveryMode = mode; $("#delivery-mode").value = mode;
+  if (mode !== state.deliveryMode) { state.aiConsentFor = null; closeAiConsent(); }
+  state.deliveryMode = mode;
+}
+function setRequestedDeliveryMode(content) {
+  const previousFiles = allTeamRuns()[0]?.delivery_mode === "files";
+  const mode = state.conversation?.acceptance_cases?.length
+    ? "files" : window.RoundtableDelivery.requestedMode(content, previousFiles);
+  setDeliveryMode(mode);
 }
 function restoreConversationMode() {
-  const runs = state.tasks.filter(task => !task.superseded_by).flatMap((task) => task.runs || []).sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
-  const latest = runs[0];
-  setDeliveryMode(state.conversation?.acceptance_cases?.length || latest?.delivery_mode === "files" ? "files" : latest && latest.workflow !== "decision_v1" ? "text_adaptive" : "text");
+  const task = currentTask();
+  const run = task?.runs?.[0];
+  if (run && (task.status !== "waiting" || run.status === "awaiting_input")) {
+    setDeliveryMode(run.delivery_mode === "files" ? "files" : run.workflow === "decision_v1" ? "text" : "text_adaptive");
+  } else {
+    setRequestedDeliveryMode(task?.goal || "");
+  }
 }
 function providerName(provider) { return ({ deepseek: "DeepSeek", kimi: "Kimi", qwen: "千问", gateway: "AI Gateway" })[provider] || provider || "未配置服务"; }
-function modelName() { return [...new Set((state.capabilities?.team?.roles || []).map((member) => `${member.provider_label || providerName(member.provider)} · ${member.model || "未配置模型"}`))].join("；") || "当前团队"; }
+function modelName() { return selectedMembers().map(member => `${providerName(member.provider)} · ${member.model}`).join("、") || "尚未选择成员"; }
 function applyCapabilities(data) {
   const previous = modelIdentity(); state.capabilities = data; state.capabilityError = "";
-  if (previous !== modelIdentity()) { state.aiEnabled = false; state.aiConsentFor = null; }
-  if (!chatAvailable()) state.aiEnabled = false;
+  if (previous !== modelIdentity()) { state.aiConsentFor = null; }
   renderModelControls();
 }
 async function refreshCapabilities() {
   const version = ++state.capabilityVersion;
   try { const data = await api("/api/capabilities"); if (version === state.capabilityVersion) applyCapabilities(data); return data; }
-  catch (error) { if (version === state.capabilityVersion) { state.capabilities = null; state.capabilityError = "暂时无法读取团队状态，请打开“团队与模型”刷新。需求仍可保存。"; state.aiEnabled = false; renderModelControls(); } throw error; }
+  catch (error) { if (version === state.capabilityVersion) { state.capabilities = null; state.capabilityError = "暂时无法读取团队状态，请在对话设置中刷新连接。"; state.aiConsentFor = null; renderModelControls(); } throw error; }
 }
 function renderModelControls() {
   const team = state.capabilities?.team; const available = chatAvailable();
@@ -453,28 +511,17 @@ function renderModelControls() {
   const clarifying = task?.runs?.[0]?.status === "awaiting_input" && !state.replyFeedback[state.conversation?.id]?.briefStale;
   const unresolved = Boolean(pendingSubmission(state.conversation?.id));
   if (state.pendingConsent && (state.pendingConsent !== modelIdentity() || running || !available)) closeAiConsent();
-  if ((state.conversation?.acceptance_cases?.length || state.conversation?.sources_count) && state.aiConsentFor !== modelIdentity()) state.aiEnabled = false;
   const sourcesBusy = Boolean(sourcesUI?.getState().busy);
-  $("#ai-enabled").checked = state.aiEnabled; $("#ai-enabled").disabled = !available || running || sourcesBusy || unresolved;
-  $("#delivery-mode").value = state.deliveryMode; $("#delivery-mode").disabled = running || Boolean(state.activeSave);
-  $("#participant-count-control").hidden = state.deliveryMode !== "text";
-  $("#participant-count-note").hidden = state.deliveryMode !== "text";
-  $("#participant-count").value = state.participantCount;
-  $("#participant-count").disabled = running || Boolean(state.activeSave) || unresolved;
-  $("#delivery-mode-note").textContent = state.deliveryMode === "files" ? "先规划与分工，再交付文件和检查记录；必需工具不可用时会说明原因。" : state.deliveryMode === "text_adaptive" ? "沿用按任务规划与分工的原文字流程。" : "需要更多信息时，成员会在对话里问你。";
+  renderParticipantOptions(running || Boolean(state.activeSave) || unresolved || clarifying);
   $("#message-input").placeholder = clarifying ? "回复圆桌成员…" : "向圆桌提问，或交代一个目标";
   $("#message-input").maxLength = clarifying ? 2000 : 12000;
   $("#connection-summary").textContent = state.capabilityError || team?.notice || (team ? "团队仍需完成模型连接与验收。" : "正在读取团队状态。");
-  $("#team-members").replaceChildren(...(team?.roles || []).map((member) => el("div", { class: "team-member" }, [el("strong", { text: member.label || member.role }), el("span", { text: `${member.provider_label || providerName(member.provider)} · ${member.model || "未配置模型"}` }), el("small", { text: member.ready ? "已验收" : "待验收" })])));
-  $("#connection-instructions").textContent = state.deliveryMode === "text" ? "团队先分别独立分析，再交叉核验和回应；模型分工及实际效果仍需实测比较。" : "主助手先安排2至4项成员工作，再按依赖组织执行、交叉审查与核验。具体成员任务会出现在协作记录中；最佳模型仍需实测比较。";
-  $("#availability-text").textContent = clarifying ? "回复或跳过后，团队将按本轮已确认的额度继续。" : running ? "后台处理本轮任务 · 停止后可继续发送" : state.capabilityError || (available ? (state.aiEnabled ? `AI 已开启 · 最多 ${deliveryLimit()} 次调用，使用模型额度` : state.saveOnlyMode ? "仅保存到圆桌" : "首次发送时确认参与的模型和费用") : team?.configured ? "模型待验收 · 当前仅保存需求" : team ? "AI 未配置 · 当前仅保存需求" : "读取团队状态中…");
-  if ($("#composer-options-label")) $("#composer-options-label").textContent = state.deliveryMode === "files" ? "多文件成果" : state.deliveryMode === "text_adaptive" ? "文字任务" : "文字讨论";
-  if (!running && !clarifying && state.deliveryMode === "text" && team?.decision_hint) {
-    $("#availability-text").textContent = team.decision_hint + " 当前可保存问题。";
-    $("#connection-summary").textContent = team.decision_hint;
+  $("#availability-text").textContent = clarifying ? "回复或跳过后，团队将按本轮已确认的额度继续。" : running ? "后台处理本轮任务 · 停止后可继续发送" : state.capabilityError || (available ? (hasTeamConsent() ? `本轮最多 ${deliveryLimit()} 次模型调用` : "首次发送时确认参与成员和调用额度") : team?.configured ? "模型待验收 · 可先保存需求" : team ? "AI 未配置 · 可先保存需求" : "读取团队状态中…");
+  if (!running && !clarifying && team && !available) {
+    $("#availability-text").textContent = "请选择至少两位已就绪的成员，当前可先保存问题。";
     $("#message-input").placeholder = "写下想讨论的问题，可先保存";
   }
-  const sendForDiscussion = available && (state.aiEnabled || !state.saveOnlyMode);
+  const sendForDiscussion = available;
   const actionLabel = clarifying ? "发送回答并继续" : running ? "协作中" : task?.status === "paused" ? "保存补充" : sendForDiscussion ? "发送并开始团队协作" : "保存需求";
   $("#send-message").setAttribute("aria-label", actionLabel); $("#send-message").title = actionLabel;
   $("#composer-hint").textContent = `Enter ${actionLabel} · Shift + Enter 换行`;
@@ -490,7 +537,7 @@ function renderModelControls() {
   renderInterjectionControls();
   const budget = state.capabilities?.hourly_budget;
   const reset = budget?.resets_at ? new Date(budget.resets_at) : null;
-  if (!running && !clarifying && available && !state.saveOnlyMode && reset > new Date() && budget.remaining < deliveryLimit()) {
+  if (!running && !clarifying && available && reset > new Date() && budget.remaining < deliveryLimit()) {
     const when = reset.toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"});
     $("#availability-text").textContent = `本小时还可调用 ${budget.remaining} 次，${when} 恢复。${budget.remaining ? "较长的讨论可能提前结束。" : "现在仍可保存问题。"}`;
   }
@@ -573,7 +620,7 @@ async function loadAcceptanceEditor(editor) {
     const previous = modelIdentity();
     state.conversationRevision++;
     state.conversation = { ...state.conversation, acceptance_cases: data.cases, acceptance_revision: data.revision };
-    if (previous !== modelIdentity()) { state.aiEnabled = false; state.aiConsentFor = null; }
+    if (previous !== modelIdentity()) { state.aiConsentFor = null; }
     state.acceptanceStatus = { conversationId: editor.conversationId, authVersion: editor.authVersion, viewVersion: editor.viewVersion, revision: data.revision, available: data.execution_available };
     editor.cases = data.cases.map((item) => ({ stdin: item.stdin, expected_stdout: item.expected_stdout }));
     editor.revision = data.revision; editor.loaded = true; editor.conflict = false;
@@ -606,7 +653,7 @@ async function saveAcceptanceEditor(event) {
     state.conversation = { ...data.conversation, acceptance_cases: data.cases, acceptance_revision: data.revision };
     const available = typeof data.execution_available === "boolean" ? data.execution_available : state.acceptanceStatus?.available;
     state.acceptanceStatus = { conversationId: editor.conversationId, authVersion: editor.authVersion, viewVersion: editor.viewVersion, revision: data.revision, available };
-    state.aiEnabled = false; state.aiConsentFor = null;
+    state.aiConsentFor = null;
     closeAcceptanceEditor(); renderModelControls();
     $("#acceptance-open").focus();
   } catch (error) {
@@ -627,8 +674,8 @@ function renderReplyFeedback() {
   else if (task?.runs?.[0]?.status === "needs_review" && !text) text = "核验发现待修订项，可查看协作记录并补充要求。";
   else if (task?.status === "failed" && !text) text = task.runs?.[0]?.error || "本轮未完成。需求已保存，可查看记录后重新协作。";
   else if (task?.status === "waiting" && !text) {
-    text = !chatAvailable() ? (state.capabilityError || (state.deliveryMode === "text" && state.capabilities?.team?.decision_hint ? "问题已保存。" + state.capabilities.team.decision_hint : state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看团队与模型。" : "需求已保存，正在读取团队状态。"))
-      : state.aiEnabled ? "需求已保存，可以开始协作。" : "需求已保存，尚未开始回复。请先开启 AI 团队。";
+    text = !chatAvailable() ? (state.capabilityError || (state.deliveryMode === "text" && state.capabilities?.team?.decision_hint ? "问题已保存。" + state.capabilities.team.decision_hint : state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看成员状态。" : "需求已保存，正在读取团队状态。"))
+      : "需求已保存，可以开始团队协作。";
   }
   $("#reply-feedback").hidden = !text && !needsBrief; $("#reply-feedback-text").hidden = !text; $("#reply-feedback-text").textContent = text;
   $("#reply-feedback").classList.toggle("has-error", !pending && (feedback?.error || task?.status === "failed"));
@@ -649,8 +696,8 @@ function renderReplyFeedback() {
   $("#skip-clarification").textContent = draft?.public_search_query || draft?.public_search_requested ? "跳过检索，继续讨论" : "暂不回答，继续讨论";
   $("#skip-clarification").hidden = !needsBrief;
   $("#skip-clarification").disabled = Boolean(state.activeSave) || Boolean(state.activeReply);
-  $("#request-reply").textContent = feedback?.briefStale ? "重新整理问题" : !state.aiEnabled ? "开启 AI 团队" : task?.status === "failed" || feedback?.error ? "重新协作" : "开始团队协作";
-  $("#request-reply").disabled = !chatAvailable() || Boolean(state.activeSave) || Boolean(state.activeReply) || (!needsBrief && !state.aiEnabled && $("#ai-enabled").disabled);
+  $("#request-reply").textContent = feedback?.briefStale ? "重新整理问题" : task?.status === "failed" || feedback?.error ? "重新协作" : "开始团队协作";
+  $("#request-reply").disabled = !chatAvailable() || Boolean(state.activeSave) || Boolean(state.activeReply) || Boolean(sourcesUI?.getState().busy) || Boolean(unresolved);
   $("#retry-pending-submission").hidden = !unresolved || pending || !task || !["waiting", "failed"].includes(task.status) || task.id !== unresolved.body.expected_task;
   $("#retry-pending-submission").disabled = Boolean(state.activeSave) || Boolean(state.activeReply);
   $("#stop-waiting").hidden = true;
@@ -801,13 +848,13 @@ async function requestReply(reusePending = false) {
   if (sourcesUI?.getState().busy) return;
   if (!state.conversation || state.activeReply || state.activeSave || !["waiting", "failed"].includes(task?.status)) return;
   const saved = pendingSubmission(state.conversation.id);
-  if (reusePending ? (!saved || saved.body.expected_task !== task.id) : (saved || !chatAvailable() || !state.aiEnabled || state.aiConsentFor !== modelIdentity())) return;
+  if (reusePending ? (!saved || saved.body.expected_task !== task.id) : (saved || !chatAvailable() || !hasTeamConsent())) return;
   const clientRequestId = reusePending ? saved.id : crypto.randomUUID();
   const body = reusePending ? saved.body : { background: true, client_request_id: clientRequestId, confirm_cost: true,
     expected_team: state.capabilities.team.revision, expected_acceptance: state.conversation.acceptance_revision,
     expected_task: task.id, expected_task_updated_at: task.updated_at, expected_sources: state.conversation.sources_revision,
     delivery_mode: state.deliveryMode === "files" ? "files" : "text", workflow: state.deliveryMode === "text" ? "decision_v1" : "adaptive", expected_max_calls: deliveryLimit(),
-    ...(state.deliveryMode === "text" && state.participantCount ? {participant_count: Number(state.participantCount)} : {}) };
+    participant_ids: selectedMembers().map(member => member.id) };
   const request = { conversationId: state.conversation.id, taskId: task.id, viewVersion: state.viewVersion, authVersion: state.authVersion, controller: new AbortController(), clientRequestId };
   if (!reusePending && !rememberSubmission(request.conversationId, {id: clientRequestId, body})) {
     showToast("浏览器无法保存本次提交标识，请允许会话存储后重试；本轮未开始。", true); return;
@@ -840,13 +887,13 @@ async function requestReply(reusePending = false) {
     if (state.activeReply !== request || !replyContextCurrent(request)) return;
     if ((!reusePending && error.status >= 400 && error.status < 500 && error.status !== 408) ||
         (reusePending && error.code === "acceptance_task_changed")) forgetSubmission(request.conversationId, request.clientRequestId);
-    else { state.aiEnabled = false; state.aiConsentFor = null; }
+    else { state.aiConsentFor = null; }
     state.activeReply = null;
     clearReplyMonitoring(request);
     const taskChanged = error.code === "acceptance_task_changed";
     const taskChangedText = "任务已更新，本次协作未启动。请核对最新需求与验收用例，重新确认 AI 团队后再开始。";
-    if (["connection_changed", "team_changed", "acceptance_changed", "acceptance_task_changed", "sources_changed"].includes(error.code)) { state.aiEnabled = false; state.aiConsentFor = null; }
-    state.replyFeedback[request.conversationId] = { text: taskChanged ? taskChangedText : ["connection_changed", "team_changed"].includes(error.code) ? "团队或模型连接已变更，协作已停止。你的原文已保存，请刷新团队状态，重新开启并确认后再开始；已经发出的请求可能产生费用。" : `${error.message || "网络连接中断。"} 你的原文已保存，无需再次发送。`, error: true };
+    if (["connection_changed", "team_changed", "acceptance_changed", "acceptance_task_changed", "sources_changed"].includes(error.code)) { state.aiConsentFor = null; }
+    state.replyFeedback[request.conversationId] = { text: taskChanged ? taskChangedText : ["connection_changed", "team_changed"].includes(error.code) ? "团队或模型连接已变更，协作已停止。你的原文已保存。请刷新团队状态，重新确认参与成员。已经发出的请求可能产生费用。" : `${error.message || "网络连接中断。"} 你的原文已保存，无需再次发送。`, error: true };
     renderModelControls();
     try {
       await reloadConversation(request.conversationId, request.viewVersion);
@@ -883,7 +930,7 @@ async function switchView(view) {
   closeAcceptanceEditor();
   rememberDraft();
   if (isMfaBlocked() && view !== "security") { showToast("请先完成账号的多因素验证。", true); view = "security"; }
-  if (view === "release" && state.user?.role !== "admin") view = "roundtable";
+  if (!Object.hasOwn(viewNames, view)) view = "roundtable";
   stopReplyWaiting("navigation"); state.view = view; const version = ++state.viewVersion; closeSidebar();
   for (const name of Object.keys(viewNames)) $(`#${name}-view`).hidden = name !== view;
   document.querySelectorAll(".nav-item").forEach((node) => { node.classList.toggle("active", node.dataset.view === view); if (node.dataset.view === view) node.setAttribute("aria-current", "page"); else node.removeAttribute("aria-current"); });
@@ -892,7 +939,7 @@ async function switchView(view) {
   if (view === "roundtable") { renderChat(); resumeReplyMonitoring(); return; }
   const target = $(`#${view}-view`); target.replaceChildren(heading(viewNames[view], "正在读取你的内容…"));
   try {
-    const render = { projects: projectsPage, memories: memoriesPage, capabilities: capabilitiesPage, quality: () => qualityUI.render(), data: dataPage, security: securityPage, release: releasePage }[view];
+    const render = { projects: projectsPage, memories: memoriesPage, data: dataPage, security: securityPage }[view];
     const nodes = await render(); if (version === state.viewVersion) target.replaceChildren(...nodes);
   } catch (error) { if (version === state.viewVersion) target.replaceChildren(heading(viewNames[view], ""), notice(error.message, true), button("重新加载", () => switchView(view))); }
 }
@@ -937,8 +984,9 @@ async function sendMessageEdit() {
   const content = edit.draft.trim();
   if (!content) { showToast("请输入修改后的消息。", true); return; }
   if (content === edit.original) { state.messageEdit = null; state.messageSignature = ""; renderChat(true); return; }
+  setRequestedDeliveryMode(content);
   const operation = {version: state.viewVersion, authVersion: state.authVersion, conversationId: edit.conversationId,
-    wantReply: chatAvailable() && state.aiEnabled, model: modelIdentity()};
+    wantReply: chatAvailable() && hasTeamConsent(), model: modelIdentity()};
   state.activeSave = operation; state.conversationRevision++; renderModelControls();
   const save = $(".message-edit-save"); const cancel = $(".message-edit-cancel");
   if (save) save.disabled = true; if (cancel) cancel.disabled = true;
@@ -950,7 +998,7 @@ async function sendMessageEdit() {
     state.messageEdit = null; state.messageSignature = ""; state.followLatest = true;
     delete state.replyFeedback[operation.conversationId];
     await reloadConversation(operation.conversationId, operation.version);
-    shouldReply = operation.wantReply && state.aiEnabled && chatAvailable() && operation.model === modelIdentity() && currentTask()?.status === "waiting";
+    shouldReply = operation.wantReply && hasTeamConsent() && chatAvailable() && operation.model === modelIdentity() && currentTask()?.status === "waiting";
     await refreshWorkspace().catch(() => {});
   } catch (error) {
     if (operation.authVersion === state.authVersion && operation.version === state.viewVersion) showToast(error.message || "修改未确认，请重试。", true);
@@ -975,6 +1023,8 @@ function renderChat(preserveArtifacts = false) {
   if (hasConversation) $("#composer-project").value = state.conversation.project_id || "";
   const task = currentTask();
   const runsForChat = allTeamRuns();
+  const bundles = state.tasks.filter(task => !task.superseded_by)
+    .flatMap(task => (task.artifacts || []).filter(artifact => artifact.kind === "bundle"));
   const existingMessageIds = new Set([...$("#messages").querySelectorAll("[data-message]")].map(node => node.dataset.message));
   if (!switched && follow && !state.reportScrollTarget) {
     const report = runsForChat.find(run => run.workflow === "decision_v1" && run.status === "completed"
@@ -983,7 +1033,7 @@ function renderChat(preserveArtifacts = false) {
       && state.messages.some(message => message.id === run.decision.result_message_id && !message.superseded_by));
     if (report) state.reportScrollTarget = {conversationId: state.conversation?.id, messageId: report.decision.result_message_id};
   }
-  const signature = JSON.stringify([state.messages.map((item) => [item.id, item.role, item.content, item.created_at, item.superseded_by, item.edited_from]), state.messageEdit?.id, task?.status, runsForChat.map(run => [run.id, run.status, run.decision?.response_kind, run.decision?.result_message_id, run.discussion])]);
+  const signature = JSON.stringify([state.messages.map((item) => [item.id, item.role, item.content, item.created_at, item.superseded_by, item.edited_from]), state.messageEdit?.id, task?.status, bundles.map(file => file.id), runsForChat.map(run => [run.id, run.status, run.decision?.response_kind, run.decision?.result_message_id, run.discussion])]);
   if (signature !== state.messageSignature || switched) {
     state.messageSignature = signature;
     const archived = state.messages.filter(message => message.superseded_by);
@@ -1028,6 +1078,12 @@ function renderChat(preserveArtifacts = false) {
           el("time", {class: "message-meta", datetime: message.created_at || "", text: dateText(message.created_at)})])]);
     });
     const timeline = messages.map((node, index) => node ? {node, time: activeMessages[index].created_at || '', order: 0} : null).filter(Boolean);
+    for (const bundle of bundles) {
+      const label = bundle.review_status === "draft" ? "下载待复核草稿" : "下载文件成果";
+      const link = exportLink("/api/artifacts/" + encodeURIComponent(bundle.id) + "/download",
+        label + " · 第 " + bundle.revision + " 版（ZIP）");
+      timeline.push({node: el("div", {class: "message assistant"}, [link]), time: bundle.created_at || "", order: 1});
+    }
     for (const run of runsForChat) {
       if (run.workflow !== 'decision_v1' || run.decision?.response_kind === 'quick') continue;
       for (const item of run.discussion || []) {
@@ -1252,9 +1308,11 @@ function renderInterjectionControls() {
   }
   if (select.dataset.run !== (run?.id || "")) {
     const saved = interjectionDraft();
-    const providers = [...new Set([...(run?.steps || []).map(step => step.provider),
-      ...(state.capabilities?.team?.roles || []).map(role => role.provider),
-      saved?.runId === run?.id ? saved?.target : ""].filter(Boolean))];
+    const frozen = run?.decision?.selected_members;
+    const candidates = frozen ? frozen.map(member => member.provider).filter((provider, i, all) =>
+      all.indexOf(provider) === all.lastIndexOf(provider)) :
+      [...(run?.steps || []).map(step => step.provider), ...(state.capabilities?.team?.roles || []).map(role => role.provider)];
+    const providers = [...new Set([...candidates, saved?.runId === run?.id ? saved?.target : ""].filter(Boolean))];
     select.replaceChildren(el("option", {value: "", text: "全体成员"}), ...providers.map(provider => el("option", {value: provider, text: providerName(provider)})));
     select.dataset.run = run?.id || "";
     const draft = interjectionDraft();
@@ -1577,7 +1635,7 @@ async function loadConversationArtifacts() {
     const data = await api(`/api/conversations/${encodeURIComponent(context.conversationId)}/artifacts`);
     if (!artifactContextCurrent(context)) return;
     const artifacts = (Array.isArray(data.artifacts) ? data.artifacts : []).slice().sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")) || (Number(b.revision) || 0) - (Number(a.revision) || 0));
-    list.replaceChildren(el("h2", { class: "artifact-list-title", text: "本对话的成果" }), el("p", { class: "artifact-history-note", text: "新版本显示在前。历史版本会保留；继续修改时，直接在此对话补充要求。" }), ...(artifacts.length ? artifacts.map((artifact) => artifactCard(artifact, context)) : [notice("尚无成果文件。可以先生成需求文件，或选择成果形式并开始团队协作。") ]));
+    list.replaceChildren(el("h2", { class: "artifact-list-title", text: "本对话的成果" }), el("p", { class: "artifact-history-note", text: "新版本显示在前。历史版本会保留；继续修改时，直接在此对话补充要求。" }), ...(artifacts.length ? artifacts.map((artifact) => artifactCard(artifact, context)) : [notice("尚无成果文件。可以在对话中请团队制作文件。") ]));
   } catch (error) {
     if (artifactContextCurrent(context)) list.replaceChildren(notice(error.message || "暂时无法读取成果。", true), button("重新加载成果", loadConversationArtifacts));
   }
@@ -1612,35 +1670,21 @@ async function memoriesPage() {
   return nodes;
 }
 
-async function capabilitiesPage() {
-  const data = await refreshCapabilities();
-  const labels = { available: "已验证可用", pending: "待交付", partial: "部分可用", unavailable: "暂不可用", unverified: "待验证" };
-  const team = data.team || {};
-  const nodes = [heading("能力进展", "各项能力的接入与验证状态。"), el("section", { class: "card connection-card" }, [el("h2", { text: team.configured ? "文字协作团队" : "团队模型待配置" }), el("p", { text: team.notice || "请先完成团队中各模型的连接与验收，再刷新状态。" }), el("p", { text: modelName() }), button("查看团队与模型", async () => { await switchView("roundtable"); $("#composer-options").open = true; $("#connection-help").open = true; $("#connection-help").scrollIntoView({ block: "nearest" }); })])];
-  if (data.material_tools?.length) nodes.push(el("section", { class: "card" }, [
-    el("h2", { text: "已接通的资料工具" }),
-    ...data.material_tools.map(tool => el("div", { class: "list-row" }, [el("div", {}, [el("h3", { text: tool.name }), el("p", { text: tool.description })])])),
-    el("p", { text: "在对话中保存需求后，从输入框旁添加材料；只有选中的正文会在确认 AI 协作后发送给模型。" }),
-  ]));
-  nodes.push(el("div", { class: "card-grid" }, (data.capabilities || []).map((capability, index) => el("article", { class: "card" }, [el("div", { class: "capability-title" }, [el("div", {}, [el("p", { class: "eyebrow", text: `CAPABILITY ${String(index + 1).padStart(2, "0")}` }), el("h2", { text: capability.name })]), el("span", { class: "pending-badge", text: labels[capability.status] || "待交付" })]), el("p", { text: capability.reason || "尚未完成接入与验证。" }), ...(capability.subcapabilities || []).map((sub) => el("div", { class: "list-row" }, [el("div", {}, [el("h3", { text: sub.name }), sub.reason ? el("p", { text: sub.reason }) : null]), el("span", { class: "pending-badge", text: labels[sub.status] || "待交付" })]))]))));
-  nodes.push(el("h2", { class: "section-title", text: "发布路径" }), notice("内部测试 → 小范围公测 → 正式开放。正式开放前，所有承诺首版提供的功能都必须通过对应验收。正式上线功能向所有普通用户开放。"));
-  return nodes;
-}
-
 function row(title, description, actions) { return el("div", { class: "settings-row" }, [el("div", {}, [el("h3", { text: title }), el("p", { text: description })]), el("div", { class: "row-actions" }, Array.isArray(actions) ? actions : [actions])]); }
 
 async function dataPage() {
   const data = await api("/api/data/overview");
-  const names = { projects: "项目", conversations: "对话", messages: "消息", tasks: "任务", artifacts: "成果", memories: "记忆", quality_rounds: "质量评估" };
+  const names = { projects: "项目", conversations: "对话", messages: "消息", tasks: "任务", artifacts: "成果", memories: "记忆" };
+  if (data.counts?.quality_rounds > 0) names.quality_rounds = "历史评估记录";
   const nodes = [heading("数据中心", "查看你的数据，决定如何保存和带走。", exportLink("/api/data/export", "↓ 导出全部数据")), el("div", { class: "stat-grid" }, Object.entries(data.counts || {}).filter(([key]) => names[key]).map(([key, count]) => el("div", { class: "stat-card" }, [el("strong", { text: String(count) }), el("span", { text: names[key] })])))];
   const policy = data.policy || {}; const retention = el("select", { "aria-label": "数据保留期限" }, [{ value: 0, title: "长期保留" }, { value: 30, title: "30 天" }, { value: 90, title: "90 天" }, { value: 365, title: "365 天" }].map((item) => el("option", { value: item.value, text: item.title }))); retention.value = String(policy.retention_days || 0);
   const automatic = el("input", { type: "checkbox", "aria-label": "自动清理超期对话" }); automatic.checked = Boolean(policy.auto_cleanup);
   const autoChoice = el("label", { class: "retention-choice" }, [automatic, "自动清理超期对话"]);
-  nodes.push(el("section", { class: "card" }, [row("数据保留偏好", "适用于会话、消息、任务和成果；项目、记忆与质量评估单独管理。", [retention, autoChoice, button("保存", async () => {
+  nodes.push(el("section", { class: "card" }, [row("数据保留偏好", "设置对话及其消息、任务和成果的保留期限。", [retention, autoChoice, button("保存", async () => {
     if (automatic.checked && Number(retention.value) === 0) throw new Error("请先选择 30、90 或 365 天的保留期限。");
     const result = await api("/api/data/policy", { method: "POST", body: { retention_days: Number(retention.value), auto_cleanup: automatic.checked, confirm_auto_cleanup: automatic.checked } });
     showToast(result.policy.notice); await switchView("data");
-  })]), notice(`${policy.auto_cleanup ? "已开启自动清理，后台服务运行时会处理超期对话。" : "当前为手动清理；勾选并保存后，后台服务运行时会自动处理超期对话。"}进行中的任务会保留。历史备份、导出文件和外部服务需另行处理。`), row("个人数据导出", "导出项目、对话、任务、成果、记忆与质量评估；不会导出密码或认证密钥。", exportLink("/api/data/export", "导出 JSON"))]));
+  })]), notice(`${policy.auto_cleanup ? "已开启自动清理，后台服务运行时会处理超期对话。" : "当前为手动清理；勾选并保存后，后台服务运行时会自动处理超期对话。"}进行中的任务会保留。历史备份、导出文件和外部服务需另行处理。`), row("个人数据导出", "下载项目、对话、任务、成果、记忆等个人数据。导出文件不含密码或认证密钥。", exportLink("/api/data/export", "导出 JSON"))]));
   nodes.push(notice(data.notice || "保留期限设置已保存为偏好。自动定期清理尚待交付，当前不会因设置期限而自动删除数据。"));
   const requests = data.deletion_requests || [];
   nodes.push(el("h2", { class: "section-title", text: "账号注销与删除申请" }), el("section", { class: "card" }, [row("申请注销账号", "提交后记录申请并等待处理。当前版本不会自动删除账号或数据。", button("提交申请", () => openForm("申请注销账号", [{ name: "password", label: "输入当前密码确认", type: "password", autocomplete: "current-password" }], "提交注销申请", async (values) => { const result = await api("/api/data/deletion-requests", { method: "POST", body: { password: values.password, confirm: true } }); await switchView("data"); showToast(result.notice || "申请已提交，等待处理。"); }, "此操作会创建注销与删除申请，并不立即删除数据。你可以在处理前撤回。"), "button danger")), ...requests.map((request) => {
@@ -1664,7 +1708,7 @@ async function dataPage() {
       showAuth(); setAuthMode("login");
       openForm("当前账号已注销", [], "知道了", async () => {}, `当前数据库中的账号及关联记录已删除。历史备份仍需人工处理，导出文件及外部服务的数据不在本次删除范围内。处理编号：${result.receipt}`);
     };
-  }, "此操作不可撤销：将删除当前数据库中的账号、项目、对话、资料、成果、记忆、质量评估和安全记录。会保留不含账号内容的核对记录。历史备份、已导出文件及外部模型已收到的数据不会自动删除；恢复旧备份前需处理已注销账号。建议先导出需要保留的数据。"), "button danger");
+  }, "注销后，当前数据库中的账号及其全部关联数据都会删除，无法撤销。会保留不含账号内容的核对记录。历史备份、已导出文件及外部模型已收到的数据不会自动删除；恢复旧备份前需处理已注销账号。建议先导出需要保留的数据。"), "button danger");
   removeAccount.disabled = deletion.available === false;
   nodes.push(el("section", { class: "card" }, [row("立即注销并删除当前数据", deletion.available === false ? "当前是最后一名管理员，请先设置另一名管理员。" : "删除当前数据库中的账号及关联记录；历史备份仍需人工处理。", removeAccount)]));
   nodes.push(notice(deletion.backup_notice || "历史备份、已导出文件和外部服务的数据不会自动删除。"));
@@ -1720,24 +1764,6 @@ function changePassword() {
     const result = await api("/api/auth/password/change", { method: "POST", body: values });
     afterDialog = () => { void switchView("security"); showToast(result.message || "密码已更新"); };
   }, "修改后，其他设备需要重新登录。");
-}
-
-async function releasePage() {
-  const [{ report }, deletion] = await Promise.all([api("/api/release-readiness"), api("/api/data/deletion-backups")]);
-  const labels = { passed: "已满足", failed: "待配置", pending: "待验收" };
-  const sections = [heading("上线准备", "查看正式开放前的配置和验收进度。"),
-    el("section", { class: "card" }, [row(report.ready ? "检查已通过" : "尚未达到正式开放条件",
-      `已满足 ${report.counts.passed} 项 · 待配置 ${report.counts.failed} 项 · 待验收 ${report.counts.pending} 项`, el("span", { class: "tag", text: report.ready ? "已满足" : "准备中" }))]),
-    notice("这是只读检查，不会调用模型、发送邮件或部署。配置通过也需要独立验收。"),
-    el("section", { class: "card" }, [row("删除记录与备份", `账号注销 ${deletion.pending_count} 项 · 单项删除 ${deletion.record_receipts_count || 0} 项；历史备份不会自动清理。`,
-      exportLink("/api/data/deletion-backups/ledger", "导出核对清单"))]),
-    notice(deletion.notice || "备份与外部服务仍需分别处理。")];
-  for (const [scope, title] of [["configuration", "环境配置"], ["acceptance", "实际验收"]]) {
-    sections.push(el("h2", { class: "section-title", text: title }));
-    sections.push(el("section", { class: "card" }, report.checks.filter((item) => item.scope === scope)
-      .map((item) => row(item.name, item.detail, el("span", { class: "tag", text: labels[item.status] || "待检查" })))));
-  }
-  return sections;
 }
 
 async function securityPage() {
@@ -1826,16 +1852,6 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape" && 
 $("#conversation-search")?.addEventListener("input", renderConversationList);
 $("#composer-project").addEventListener("change", () => { rememberDraft(); renderModelControls(); });
 $("#logout").addEventListener("click", () => busy($("#logout"), async () => { rememberDraft(); await flushDrafts(); await api("/api/auth/logout", { method: "POST", body: {} }); try { sessionStorage.removeItem(`roundtable:conversation:${state.user.id}`); } catch {} state.user = null; state.auth = null; state.projects = []; state.conversations = []; showAuth(); setAuthMode("login"); }));
-document.querySelectorAll(".starter").forEach((node) => node.addEventListener("click", () => { const input = $("#message-input"); input.value = input.value.trim() ? input.value : node.dataset.prompt; rememberDraft(); resizeComposer(); renderModelControls(); input.focus(); }));
-$("#delivery-mode").addEventListener("change", () => {
-  if (state.activeReply || state.activeSave || currentTask()?.status === "running") { $("#delivery-mode").value = state.deliveryMode; return; }
-  setDeliveryMode($("#delivery-mode").value); renderModelControls();
-});
-$("#participant-count").addEventListener("change", () => {
-  if (state.activeReply || state.activeSave || currentTask()?.status === "running" || pendingSubmission(state.conversation?.id)) { $("#participant-count").value = state.participantCount; return; }
-  state.participantCount = $("#participant-count").value;
-  state.aiEnabled = false; state.aiConsentFor = null; closeAiConsent(); renderModelControls();
-});
 $("#acceptance-open").addEventListener("click", () => { void openAcceptanceEditor(); });
 $("#acceptance-close").addEventListener("click", closeAcceptanceEditor);
 $("#acceptance-cancel").addEventListener("click", closeAcceptanceEditor);
@@ -1848,15 +1864,6 @@ $("#acceptance-add").addEventListener("click", () => {
 });
 $("#acceptance-reload").addEventListener("click", () => { if (state.acceptanceEditor) void loadAcceptanceEditor(state.acceptanceEditor); });
 $("#acceptance-form").addEventListener("submit", saveAcceptanceEditor);
-$("#ai-enabled").addEventListener("change", () => {
-  if (pendingSubmission(state.conversation?.id)) { state.aiEnabled = false; renderModelControls(); return; }
-  if (!$("#ai-enabled").checked) { state.aiEnabled = false; state.saveOnlyMode = true; closeAiConsent(); renderModelControls(); return; }
-  if (!chatAvailable()) { state.aiEnabled = false; renderModelControls(); return; }
-  const identity = modelIdentity();
-  if (state.aiConsentFor === identity) { state.aiEnabled = true; state.saveOnlyMode = false; renderModelControls(); return; }
-  $("#ai-enabled").checked = false;
-  promptAIConsent("enable");
-});
 function promptAIConsent(action) {
   if (!chatAvailable() || state.activeSave || state.activeReply || sourcesUI?.getState().busy) return;
   state.pendingConsent = modelIdentity();
@@ -1867,10 +1874,10 @@ function promptAIConsent(action) {
   const materials = count ? `，以及所选 ${count} 份材料的文字与出处` : "";
   const cost = state.deliveryMode === "text"
     ? `单独点名时只由该成员回复，调用 1 次；全队讨论最多调用 ${deliveryLimit()} 次。`
-    : `每轮最多调用 ${deliveryLimit()} 次。`;
-  $("#ai-consent-text").textContent = `参与的模型将收到本次对话、相关成果和成员回复${materials}。可用成员：${modelName()}。${cost}使用已配置账号的额度，可能产生费用。`;
+    : `${state.deliveryMode === "files" ? "本轮将制作可下载的文件，支持 Markdown、纯文本、CSV、JSON、网页和源码。" : ""}每轮最多调用 ${deliveryLimit()} 次。`;
+  $("#ai-consent-text").textContent = `参与的模型将收到本次对话、相关成果和成员回复${materials}。参与成员：${modelName()}。${cost}使用已配置账号的额度，可能产生费用。`;
   $("#ai-consent-save").hidden = action !== "send";
-  $("#ai-consent-confirm").textContent = action === "enable" ? "开启 AI 团队" : "确认并开始讨论";
+  $("#ai-consent-confirm").textContent = "确认并开始";
   $("#ai-consent").hidden = false;
   $("#composer-options").open = false;
   $("#ai-consent-confirm").focus();
@@ -1883,7 +1890,7 @@ $("#ai-consent-confirm")?.addEventListener("click", () => {
     closeAiConsent(); renderModelControls(); return;
   }
   const action = state.consentAction;
-  state.aiConsentFor = state.pendingConsent; state.aiEnabled = true; state.saveOnlyMode = false; closeAiConsent(); renderModelControls();
+  state.aiConsentFor = state.pendingConsent; closeAiConsent(); renderModelControls();
   if ($("#composer-options")) $("#composer-options").open = false;
   $("#message-input").focus();
   if (action === "send") $("#composer").requestSubmit();
@@ -1896,8 +1903,9 @@ $("#copy-connection-command").addEventListener("click", () => busy($("#copy-conn
   try { await navigator.clipboard.writeText("配置模型.cmd"); showToast("已复制文件名：配置模型.cmd"); } catch { showToast("请复制文件名：配置模型.cmd"); }
 }));
 $("#request-reply").addEventListener("click", () => {
-  if (!state.aiEnabled) {
-    if (!$("#ai-enabled").disabled) promptAIConsent("saved");
+  restoreConversationMode();
+  if (!hasTeamConsent()) {
+    promptAIConsent("saved");
     return;
   }
   void requestReply();
@@ -1975,14 +1983,15 @@ $("#composer").addEventListener("submit", async (event) => {
     await submitClarification(content); return;
   }
   if (sourcesUI?.getState().busy) return;
+  setRequestedDeliveryMode(content);
   const saveOnly = event.submitter?.id === "ai-consent-save";
   if (saveOnly) {
     if (state.consentAction !== "send") return;
     closeAiConsent();
-  } else if (chatAvailable() && !state.aiEnabled && !state.saveOnlyMode && currentTask()?.status !== "paused") {
+  } else if (chatAvailable() && !hasTeamConsent() && currentTask()?.status !== "paused") {
     promptAIConsent("send"); return;
   }
-  const operation = { version: state.viewVersion, authVersion: state.authVersion, wantReply: !saveOnly && chatAvailable() && state.aiEnabled, model: modelIdentity(), draftKey: state.conversation?.id || "new", draftText: $("#message-input").value };
+  const operation = { version: state.viewVersion, authVersion: state.authVersion, wantReply: !saveOnly && chatAvailable() && hasTeamConsent(), model: modelIdentity(), draftKey: state.conversation?.id || "new", draftText: $("#message-input").value };
   state.conversationRevision++; state.activeSave = operation; renderModelControls(); let shouldReply = false;
   let conversationId = state.conversation?.id;
   const contextCurrent = () => operation.authVersion === state.authVersion && operation.version === state.viewVersion && state.view === "roundtable" && state.conversation?.id === conversationId;
@@ -2013,7 +2022,7 @@ $("#composer").addEventListener("submit", async (event) => {
       rememberDraft(); resizeComposer();
       renderChat();
       try { await reloadConversation(conversationId, operation.version); } catch { /* The saved response already contains the user message and task. */ }
-      shouldReply = contextCurrent() && operation.wantReply && state.aiEnabled && chatAvailable() && operation.model === modelIdentity() && currentTask()?.status === "waiting";
+      shouldReply = contextCurrent() && operation.wantReply && hasTeamConsent() && chatAvailable() && operation.model === modelIdentity() && currentTask()?.status === "waiting";
       if (contextCurrent()) $("#message-input").focus();
     }
     await refreshWorkspace().catch(() => {});
@@ -2077,24 +2086,18 @@ sourcesUI = window.RoundtableSources?.create({api,
     rememberConversation(); rememberDraft(); renderChat(true);
     void refreshWorkspace().catch(() => {});
   },
-  onMutationStart() { state.aiEnabled = false; state.aiConsentFor = null; closeAiConsent(); renderModelControls(); },
+  onMutationStart() { state.aiConsentFor = null; closeAiConsent(); renderModelControls(); },
   onBusyChange() { if (!sourcesResetting) renderModelControls(); },
   onChange(data) {
     if (!state.conversation || data.conversationId !== state.conversation.id) return;
     if (state.conversation.sources_revision !== data.revision) {
-      state.aiEnabled = false; state.aiConsentFor = null; closeAiConsent();
+      state.aiConsentFor = null; closeAiConsent();
     }
     state.conversation.sources_revision = data.revision;
     state.conversation.sources_count = data.sources.length;
     state.conversation.included_sources_count = data.sources.filter(source => source.included).length;
     renderModelControls();
   },
-});
-
-qualityUI = window.RoundtableQuality.create({api, el, button, heading, notice, openForm,
-  getVersion: () => state.viewVersion,
-  isActive: () => Boolean(state.user) && state.view === "quality",
-  refresh: () => switchView("quality"),
 });
 
 (async () => {

@@ -69,10 +69,10 @@ def _fail(item, error):
 
 
 def _claim(item):
-    from .team_views import resolve_team
+    from .team_views import run_connections
     run = item.run
     try:
-        connection = check_mention(run, item.target_provider, resolve_team())
+        connection = check_mention(run, item.target_provider, run_connections(run))
         packet = _reply_packet(item)
         if len(_json(packet)) > MAX_PACKET_CHARS:
             raise ProviderError('本轮讨论资料超过单次回应的长度上限。')
@@ -120,7 +120,7 @@ def _reply(item, connection, packet):
 
 
 def process_waiting_mention():
-    from .team_views import resolve_team
+    from .team_views import run_connections
     # Visits running rows only to retire an abandoned claim; never replays it.
     stale = timezone.now() - timezone.timedelta(minutes=10)
     candidates = TeamInterjection.objects.filter(
@@ -150,7 +150,7 @@ def process_waiting_mention():
                 if not item or item.status != 'mention_running':
                     return run_id
                 try:
-                    check_mention(item.run, item.target_provider, resolve_team())
+                    check_mention(item.run, item.target_provider, run_connections(item.run))
                 except (ConnectionError, ProviderError) as error:
                     failure = str(error)
                 if failure:

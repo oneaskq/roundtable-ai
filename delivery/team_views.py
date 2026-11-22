@@ -22,7 +22,8 @@ from .member_address import addressed_provider, member_connection
 from .models import AgentStep, RequestBudget, TeamRun, TeamInterjection
 from .provider import ProviderError, generate_reply
 from .planning import PlanToolsUnavailable
-from .team_config import ADAPTIVE_MODE_MAX_CALLS, DECISION_MAX_CALLS, FILE_EXTRA_ROLES, MAX_OUTPUT_TOKENS, MODE_MAX_CALLS, ROLES, resolve_team, team_summary
+from .team_config import (ADAPTIVE_MODE_MAX_CALLS, DECISION_MAX_CALLS, FILE_EXTRA_ROLES, MAX_OUTPUT_TOKENS,
+                          MODE_MAX_CALLS, ROLES, resolve_team, select_team, team_revision, team_summary)
 from .team_engine import TeamReviewError, run_team
 from .artifact_bundles import save_bundle_artifact
 from .views import api, task_data
@@ -31,6 +32,14 @@ from .views import api, task_data
 class RunStopped(Exception):
     def __init__(self, message, status=409):
         self.message, self.status = message, status
+
+
+def run_connections(run):
+    configured = resolve_team()
+    selected = run.decision_state.get('selected_members')
+    if selected is None:
+        return configured
+    return select_team(configured, [member['id'] for member in selected])
 
 
 @api('POST')
@@ -83,7 +92,7 @@ def _post_team_message(request, conversation_id, payload):
         if run.workflow not in ('adaptive', 'decision_v1'):
             return JsonResponse({'error': '当前协作流程不支持过程插话。'}, status=409)
         try:
-            connections = resolve_team()
+            connections = run_connections(run)
         except ConnectionError:
             return JsonResponse({'error': '团队连接不可用，请刷新后重试。'}, status=409)
         if target and target not in {connection.provider for connection in connections.values()}:
@@ -334,6 +343,13 @@ def collaborate(request, conversation_id):
     participant_count = request.payload.get('participant_count')
     if participant_count is not None and (workflow != 'decision_v1' or type(participant_count) is not int or participant_count not in (2, 3)):
         return JsonResponse({'error': '讨论成员数量无效，请选择两位或默认数量。'}, status=400)
+    member_ids = request.payload.get('participant_ids')
+    if 'participant_ids' in request.payload and (
+            workflow not in ('decision_v1', 'adaptive') or 'participant_count' in request.payload
+            or not isinstance(member_ids, list) or not 2 <= len(member_ids) <= 3
+            or any(not isinstance(item, str) or len(item) != 64 for item in member_ids)
+            or len(set(member_ids)) != len(member_ids)):
+        return JsonResponse({'error': '请选择两至三位不同的团队成员。'}, status=400)
     max_calls = (DECISION_MAX_CALLS if workflow == 'decision_v1' else
                  (ADAPTIVE_MODE_MAX_CALLS if workflow == 'adaptive' else MODE_MAX_CALLS)[mode])
     consented_calls = request.payload.get('expected_max_calls')
@@ -408,9 +424,15 @@ def collaborate(request, conversation_id):
                                      'code': 'tools_unavailable', 'status': 'not_run'}, status=422)
         try:
             connections = resolve_team()
-            summary = team_summary(connections)
         except ConnectionError as error:
             return JsonResponse({'error': str(error), 'code': 'capability_pending'}, status=503)
+        if member_ids is not None:
+            roster_revision = team_revision(connections)
+            try:
+                connections = select_team(connections, member_ids)
+            except ConnectionError as error:
+                return JsonResponse({'error': str(error), 'code': 'connection_changed'}, status=409)
+        summary = team_summary(connections)
         if summary['readiness'] != 'available':
             return JsonResponse({'error': '团队中仍有模型未通过验收，需求已保存。',
                                  'code': 'capability_pending'}, status=503)
@@ -424,10 +446,14 @@ def collaborate(request, conversation_id):
                     for source, item in zip(selected_sources, source_snapshot)], participant_count)
             except ProviderError as error:
                 return JsonResponse({'error': str(error), 'code': 'team_pending'}, status=400)
+        if member_ids is not None:
+            options = {member['id']: member for member in summary['members']}
+            decision_state['selected_members'] = [options[member_id] for member_id in member_ids]
         if request.payload.get('confirm_cost') is not True:
             return JsonResponse({'error': f'请确认团队最多 {max_calls} 次模型调用的额度使用。'}, status=400)
         expected = request.payload.get('expected_team')
-        if not isinstance(expected, str) or not constant_time_compare(expected, summary['revision']):
+        consent_revision = roster_revision if member_ids is not None else summary['revision']
+        if not isinstance(expected, str) or not expected or not constant_time_compare(expected, consent_revision):
             return JsonResponse({'error': '团队配置已改变，请刷新并重新确认参与模型。',
                                  'code': 'connection_changed'}, status=409)
         if not task or task.status not in ('waiting', 'failed'):
@@ -457,7 +483,7 @@ def collaborate(request, conversation_id):
             return JsonResponse({'error': '任务已被处理，请刷新。'}, status=409)
         try:
             with transaction.atomic():
-                run = TeamRun.objects.create(task=task, execution_id=execution_id, team_revision=expected,
+                run = TeamRun.objects.create(task=task, execution_id=execution_id, team_revision=summary['revision'],
                                              delivery_mode=mode, workflow=workflow, max_calls=max_calls,
                                              acceptance_cases=cases, background=background,
                                              status='queued' if background else 'running',
@@ -481,6 +507,11 @@ def collaborate(request, conversation_id):
                 run__task__conversation=conversation, run__task__owner=request.user,
                 run__task__superseded_by_message__isnull=True, status='pending').exclude(run=run))
             for item in deferred:
+                if member_ids is not None and item.target_provider:
+                    try:
+                        member_connection(connections, item.target_provider)
+                    except ProviderError:
+                        continue  # Leave directed messages pending for a round with that addressee.
                 if decision_state.get('direct_provider') and item.target_provider not in ('', decision_state['direct_provider']):
                     continue
                 TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
@@ -572,7 +603,7 @@ def collaborate(request, conversation_id):
             '已开始多文件协作，最多 7 次调用并包含最多一次修订；系统会实际检查文件结构与部分源码语法，不运行生成代码。'
             if mode == 'files' else '已开始文字团队协作，最多 5 次调用；本轮提供文本方案与审查，不执行联网或代码工具。')))
 
-    return execute_team_run(run, context=context, connections=connections)
+    return execute_team_run(run, context=context)
 
 
 @api('POST')
@@ -641,7 +672,7 @@ def confirm_decision_brief(request, conversation_id):
         if not constant_time_compare(case_revision(conversation.acceptance_cases), case_revision(run.acceptance_cases)):
             return JsonResponse({'error': '验收条件已改变，请重新开始一轮。', 'code': 'acceptance_changed'}, status=409)
         try:
-            current = team_summary(resolve_team())
+            current = team_summary(run_connections(run))
         except ConnectionError:
             return JsonResponse({'error': '团队连接已改变，请重新开始一轮。', 'code': 'team_changed'}, status=409)
         if current['readiness'] != 'available' or not constant_time_compare(current['revision'], run.team_revision):
@@ -704,13 +735,13 @@ def confirm_decision_brief(request, conversation_id):
         return JsonResponse({'accepted': True, 'run': serialize_run(run), 'task': task_data(task)}, status=202)
 
 
-def execute_team_run(run, *, context=None, connections=None):
+def execute_team_run(run, *, context=None):
     from .background import execution_heartbeat
     with execution_heartbeat(run):
-        return _execute_team_run(run, context=context, connections=connections)
+        return _execute_team_run(run, context=context)
 
 
-def _execute_team_run(run, *, context=None, connections=None):
+def _execute_team_run(run, *, context=None):
     """Execute a claimed run once, independently of its initiating HTTP request."""
     task = run.task
     conversation = task.conversation
@@ -738,11 +769,13 @@ def _execute_team_run(run, *, context=None, connections=None):
                 sources_revision(SourceMaterial.objects.filter(owner=request.user, conversation=conversation))):
             raise RunStopped('参考资料已改变，已停止后续调用与结果写入；请重新确认本轮资料。')
         try:
-            latest = team_summary(resolve_team())
+            current_connections = run_connections(run)
+            latest = team_summary(current_connections)
         except ConnectionError:
             raise RunStopped('团队连接已改变，已停止后续调用，请刷新配置。') from None
         if latest['readiness'] != 'available' or not constant_time_compare(latest['revision'], expected):
             raise RunStopped('团队连接或验收状态已改变，已停止后续调用；已发出的请求可能已计费。')
+        return current_connections
 
     def before_step(role, label, connection):
         with transaction.atomic():
@@ -950,9 +983,7 @@ def _execute_team_run(run, *, context=None, connections=None):
                             candidate.output + '\n\n## 核验记录\n\n' + (review.output if review else '未完成核验。'))
 
     try:
-        check_active()
-        if connections is None:
-            connections = resolve_team()
+        connections = check_active()
         if run.acceptance_cases and 'python_stdio' not in readiness()['available_tools']:
             raise PlanToolsUnavailable(['python_stdio'])
         if workflow == 'decision_v1':

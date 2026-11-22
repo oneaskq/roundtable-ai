@@ -14,7 +14,7 @@ function section(start, end) {
 function setup({loseAck = false, beforeResponse} = {}) {
   const nodes = new Map(), storage = new Map(), posts = [], runs = [];
   const state = {user:{id:'user1'}, view:'roundtable', viewVersion:1, authVersion:1, messages:[], tasks:[],
-    messageSaveIds:new Map(), drafts:new Map(), replyFeedback:{}, conversation:null, aiEnabled:false};
+    messageSaveIds:new Map(), drafts:new Map(), replyFeedback:{}, conversation:null, aiConsentFor:null};
   function $(key) {
     if (!nodes.has(key)) nodes.set(key, {value:'', listeners:{}, focus(){},
       addEventListener(type, callback) { this.listeners[type] = callback; },
@@ -25,10 +25,11 @@ function setup({loseAck = false, beforeResponse} = {}) {
   const submit = async (id = '') => $('#composer').listeners.submit({preventDefault(){},submitter:{id}});
   $('#composer').requestSubmit = () => { requested = submit(); };
   const noop = () => {};
-  const c = vm.createContext({state, $, crypto, TextEncoder, Uint8Array,
+  const c = vm.createContext({state, $, crypto, TextEncoder, Uint8Array, window: {},
     sessionStorage:{getItem:k=>storage.get(k) || null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
     requestReply: () => runs.push(state.conversation?.id), interjectionRun:()=>null, interjectionDraft:()=>null, pendingSubmission:()=>null,
-    currentTask:()=>state.tasks[0], chatAvailable:()=>true, modelIdentity:()=>state.conversation?.sources_revision || 'team',
+    currentTask:()=>state.tasks[0], allTeamRuns:()=>state.tasks.flatMap(task=>task.runs || []),
+    chatAvailable:()=>true, modelIdentity:()=>[state.deliveryMode, state.conversation?.sources_revision || 'team'].join(':'),
     sourcesUI:{getState:()=>({busy:false})}, modelName:()=>'Test A、Test B', deliveryLimit:()=>14,
     renderChat:noop,renderModelControls:noop,resizeComposer:noop,rememberConversation:noop,
     rememberDraft:noop,forgetDraft:noop,reloadConversation:async()=>{},refreshWorkspace:async()=>{},showToast:noop,
@@ -39,6 +40,9 @@ function setup({loseAck = false, beforeResponse} = {}) {
       return {conversation: {id: state.conversation?.id || opt.body.client_message_id, sources_revision:state.conversation?.sources_revision},
         message:{id:opt.body.client_message_id},task:{id:'t',status:'waiting'}};
     }});
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../static/delivery-intent.js'), 'utf8'), c);
+  vm.runInContext(section('function deliveryLimit(', 'function providerName('), c);
+  vm.runInContext(section('function hasTeamConsent()', 'function chatAvailable()'), c);
   vm.runInContext(section('function closeAiConsent()', 'function pendingDraftKey('), c);
   vm.runInContext(section('function promptAIConsent(', '$("#refresh-connection").addEventListener'), c);
   vm.runInContext(section('$("#composer").addEventListener("submit"', '$("#pause-task").addEventListener'), c);
@@ -62,6 +66,22 @@ test('cancel preserves question and attachments; save only never starts a run', 
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0].url, '/api/conversations/with-materials');
   assert.deepEqual(f.runs, []);
+});
+test('asking for a downloadable file in chat uses file collaboration and its cost before sending', async () => {
+  const f = setup();
+  f.$('#message-input').value = '把计划导出为一份 CSV 文件';
+  await f.submit();
+  assert.equal(f.state.deliveryMode, 'files');
+  assert.equal(f.posts.length, 0);
+  assert.match(f.$('#ai-consent-text').textContent, /可下载的文件.*10 次/);
+  await f.confirm();
+  assert.deepEqual(f.runs, [f.posts[0].body.client_message_id]);
+
+  f.$('#message-input').value = '解释一下刚刚这个 CSV 里的两列是什么意思';
+  await f.submit();
+  assert.equal(f.state.deliveryMode, 'text');
+  assert.match(f.$('#ai-consent-text').textContent, /14 次/);
+  assert.equal(f.posts.length, 1);
 });
 test('changing text, materials, or conversation invalidates the confirmation', async () => {
   for (const change of ['text','sources','conversation','view']) {

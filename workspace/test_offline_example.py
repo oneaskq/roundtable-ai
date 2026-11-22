@@ -20,9 +20,9 @@ class ReplayAssets(HTMLParser):
 
 
 class OfflineExampleTests(SimpleTestCase):
-    def test_home_links_to_an_offline_replay_with_all_resources_present(self):
+    def test_offline_replay_remains_available_without_a_home_shortcut(self):
         entry = 'examples/internship.html'
-        self.assertContains(self.client.get('/'), f'href="{static(entry)}"')
+        self.assertNotContains(self.client.get('/'), f'href="{static(entry)}"')
         page = Path(finders.find(entry))
         assets = ReplayAssets()
         assets.feed(page.read_text(encoding='utf-8'))

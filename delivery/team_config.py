@@ -7,7 +7,7 @@ import tempfile
 from django.conf import settings
 from django.utils.crypto import salted_hmac
 
-from .catalog import chat_available
+from .catalog import chat_available, connection_revision
 from .connections import ConnectionError, get_connection, load_named_connection
 
 
@@ -93,17 +93,41 @@ def team_revision(connections):
                        algorithm='sha256').hexdigest()
 
 
+def member_info(connection):
+    return {'id': connection_revision(connection), 'provider': connection.provider,
+            'provider_label': connection.provider_label, 'model': connection.model}
+
+
+def select_team(connections, member_ids):
+    """Retain matching role assignments and fill vacant roles only from the consented roster."""
+    by_id = {connection_revision(c): c for c in connections.values() if c.configured}
+    if any(member_id not in by_id for member_id in member_ids):
+        raise ConnectionError('选定的模型连接已改变，请刷新后重新选择。')
+    selected = [by_id[member_id] for member_id in member_ids]
+    selected_fingerprints = {member.fingerprint for member in selected}
+    assigned = {role: c for role, c in connections.items() if c.fingerprint in selected_fingerprints}
+    paired = {'proposer': 'challenger', 'challenger': 'proposer',
+              'synthesizer': 'verifier', 'verifier': 'synthesizer'}
+    for role, _ in ROLES:
+        if role not in assigned:
+            peer = assigned.get(paired.get(role))
+            assigned[role] = next(c for c in selected if peer is None or c.fingerprint != peer.fingerprint)
+    return assigned
+
+
 def team_summary(connections=None):
     try:
         connections = resolve_team() if connections is None else connections
         revision = team_revision(connections)
         # Repeated roles on one connection share the same acceptance result.
         readiness = {}
-        roles = []
+        roles, members = [], []
         for role, label in ROLES:
             connection = connections[role]
             if connection.fingerprint not in readiness:
                 readiness[connection.fingerprint] = chat_available(connection)
+                if connection.configured:
+                    members.append({**member_info(connection), 'ready': readiness[connection.fingerprint]})
             roles.append({'role': role, 'label': label, 'provider': connection.provider, 'provider_label': connection.provider_label,
                           'model': connection.model, 'ready': readiness[connection.fingerprint]})
         configured = all(connection.configured for connection in connections.values())
@@ -119,6 +143,7 @@ def team_summary(connections=None):
             else:
                 decision_hint = '团队还有未就绪的成员。'
         return {'configured': configured, 'decision_ready': decision_ready,
+                'members': members, 'default_member_ids': [m['id'] for m in members if m['ready']][:3],
                 'ready_connections': ready_count, 'decision_hint': decision_hint,
                 'readiness': 'available' if available else 'pending' if configured else 'unconfigured',
                 'revision': revision, 'roles': roles, 'max_calls': MAX_CALLS,
@@ -130,6 +155,7 @@ def team_summary(connections=None):
                            if available else '任务规划与分工流程已接入；参与模型仍须分别通过真实验收，未验收时不会启动。当前模型分工尚未经过效果比较。')}
     except ConnectionError as error:
         return {'configured': False, 'readiness': 'pending', 'revision': '', 'decision_ready': False,
+                'members': [], 'default_member_ids': [],
                 'decision_hint': str(error),
                 'delivery_modes': [{'id': key, 'max_calls': value} for key, value in MODE_MAX_CALLS.items()],
                 'default_workflow': 'decision_v1', 'decision_max_calls': DECISION_MAX_CALLS,
