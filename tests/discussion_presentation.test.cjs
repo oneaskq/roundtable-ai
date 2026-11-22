@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const context = {window: {}};
 vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'static', 'discussion-presentation.js'), 'utf8'), context);
-const {waiting, analysisPreview} = context.window.RoundtableDiscussion;
+const {waiting, turnPresentation} = context.window.RoundtableDiscussion;
 
 test('the wait uses running members, does not predict unstarted calls, and clears after the run', () => {
   const run = {status:'running', steps:[
@@ -36,16 +36,26 @@ test('clarification waits only for explicitly addressed outstanding questions', 
   assert.equal(waiting(run, false, s => s).busy, false);
 });
 
-test('long independent analyses quote original text, including old labeled messages', () => {
-  const content = '若能每周到岗三天，建议先确认导师安排。' + '返校优先。'.repeat(60) + '\n关键主张：\n- 先问是否灵活排班。';
-  const item = {kind:'assistant', role:'analysis_p1', content};
-  const result = analysisPreview(item,{workflow:'decision_v1'});
-  assert.deepEqual(Array.from(result), ['若能每周到岗三天，建议先确认导师安排。','先问是否灵活排班。']);
-  assert.deepEqual(Array.from(analysisPreview({...item,role:undefined,label:'独立分析 · A'},{})), Array.from(result));
-  for (const role of ['mention_10', 'quick_p1', 'clarifier', 'clarifier_peer','review_p1','synthesizer']) {
-    assert.equal(analysisPreview({...item,role},{}),null);
-  }
-  assert.equal(analysisPreview(item,{decision:{response_kind:'direct_member'}}),null);
-  assert.equal(analysisPreview({...item,content:'简短建议'},{}),null);
-  assert.equal(analysisPreview({...item,kind:'user'},{}),null);
+test('member turns keep the referenced viewpoint and every original finding intact', () => {
+  const reason = '这要看导师周五是否值班。' + '只有满足你的课表才能选。'.repeat(7);
+  const item = {kind:'assistant', content: '核验记录\n- ' + reason + '\n- 另一条有条件的意见。',
+    turn: {text: reason, detail_label:'完整核验（2 条）', reply_to:{kind:'member',label:'Kimi',text:'可以问能不能周五到岗。'}}};
+  const result = turnPresentation(item);
+  assert.equal(result.reference.label, '回应 Kimi');
+  assert.equal(result.reference.text, item.turn.reply_to.text);
+  assert.equal(result.text, reason);
+  assert.equal(result.detail, item.content);
+  assert.equal(result.detailLabel, item.turn.detail_label);
+  assert.equal(turnPresentation({...item,kind:'user'}), null);
+  assert.equal(turnPresentation({...item,turn:null}), null);
+});
+
+test('a direct response stands alone while other stage notes remain expandable', () => {
+  const text = '按你刚说的时间，可以先选周五。';
+  const turn = {text, detail_label:'完整发言', reply_to:{kind:'user',label:'你',text:'我只有周五有空。'}};
+  const item = {kind:'assistant', turn, content:text};
+  assert.equal(turnPresentation(item).detail, '');
+  assert.equal(turnPresentation(item).reference.label, '回复你');
+  assert.equal(turnPresentation({...item,content:text+'\n\n核验记录'}).detail, '核验记录');
+  assert.equal(turnPresentation({...item,turn:{text:'',detail_label:'查看原文'}}).detail, text);
 });

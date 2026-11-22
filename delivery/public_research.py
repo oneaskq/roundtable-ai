@@ -1,4 +1,4 @@
-"""Opt-in retrieval. Only the explicitly approved public keywords leave for search."""
+"""Bounded public retrieval using short, validated keywords."""
 import hashlib
 import http.client
 import json
@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -20,9 +21,37 @@ MAX_RESULTS = 2
 MAX_EXCERPT = 1800
 _SLOTS = threading.BoundedSemaphore(3)
 _PRIVATE = re.compile(r'(?i)https?://|[\w.+-]+@[\w.-]+\.\w+|(?<!\d)1[3-9]\d[ -]?\d{4}[ -]?\d{4}(?!\d)|'
-                      r'(?<!\d)\d{17}[\dX](?!\d)|(?:sk-|gh[pousr]_|github_pat_)[\w-]{12,}|BEGIN .*PRIVATE KEY|'
+                      r'(?<!\d)\d{13,19}X?(?!\d)|(?:sk-|gh[pousr]_|github_pat_|(?-i:AKIA|ASIA|LTAI))[\w-]{12,}|BEGIN .*PRIVATE KEY|'
+                      r'(?:[a-z]:[\\/]|\\\\[^\s\\]+\\|/(?:home|Users)/)\S+|'
                       r'(?:手机号|学号|身份证号|家庭住址|微信号|电子邮箱|银行卡号|我的名字|我叫)\s*[:：是为]?\s*\S+|'
                       r'(?:api[_ -]?key|access[_ -]?token|password|密码|密钥)\s*[:=：]\s*\S+')
+
+_DECLINED = re.compile(r'(?:别|不要|不用|无需|不必|禁止|不允许|不希望|不想)\s*(?:再|额外|主动)?'
+                       r'(?:联网|搜索|检索|查证|上网|查资料|查了)|(?:只|仅)(?:用|依据|根据)(?:我给的|已有|现有|所给|本轮)(?:资料|材料)'
+                       r'|\b(?:do not|don[\'’]t|no need to|never)\s+(?:search|browse|look up)\b', re.I)
+
+
+def declines_public_search(text):
+    return bool(_DECLINED.search(text))
+
+
+def suggested_query(draft):
+    """Check a model suggestion again when resuming an older stored draft."""
+    try:
+        return approved_query(draft.get('public_search_query'), True)
+    except ValueError:
+        return ''
+
+
+def set_automatic_search(state, draft, query):
+    if not (draft.get('public_search_query') or draft.get('public_search_requested')):
+        return
+    provider = draft.get('public_search_provider')
+    if query:
+        state['public_search_query'] = query
+        state['public_search_provider'] = provider
+    else:
+        state['public_research'] = {'provider': provider or '', 'status': 'invalid_query', 'sources': []}
 
 
 def approved_query(value, consent):
@@ -30,7 +59,7 @@ def approved_query(value, consent):
         return ''
     if not isinstance(value, str) or type(consent) is not bool or not consent:
         raise ValueError('公开检索前请确认将发送的关键词。')
-    if len(value) > 160 or any(not c.isprintable() for c in value) or _PRIVATE.search(value):
+    if len(value) > 160 or any(not c.isprintable() for c in value) or _PRIVATE.search(unicodedata.normalize('NFKC', value)):
         raise ValueError('请使用最多 160 字的公开关键词，移除网址、联系方式及密钥。')
     return value.strip()
 

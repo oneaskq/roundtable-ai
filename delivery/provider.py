@@ -52,6 +52,7 @@ SYSTEM_MESSAGE = {
 QWEN_STRUCTURED_HANZI_MODELS = frozenset({'qwen3.7-plus', 'qwen3.7-plus-2026-05-26'})
 QWEN_THINKING_MODELS = QWEN_STRUCTURED_HANZI_MODELS
 QWEN_THINKING_BUDGET = 2048
+QWEN_DISCUSSION_THINKING_BUDGET = 512
 STRUCTURED_HANZI_INSTRUCTION = (
     '本次使用 JSON 结构化传输。只返回含 answer 字段的对象；answer 必须是严格按照用户要求'
     '完成的最终文本原文，不添加代码围栏、额外标题或解释。'
@@ -231,7 +232,7 @@ def _prepare_messages(messages, connection):
     return prepared
 
 
-def _payload(connection, messages, max_output_tokens):
+def _payload(connection, messages, max_output_tokens, *, fast_reasoning=False):
     if max_output_tokens is None:
         max_output_tokens = 4096
     if type(max_output_tokens) is not int or not 64 <= max_output_tokens <= 32768:
@@ -251,14 +252,15 @@ def _payload(connection, messages, max_output_tokens):
         elif qwen_thinking_enabled(connection):
             if max_output_tokens < 128:
                 raise ProviderError('千问思考模式的输出上限至少为128 tokens。')
-            body.update(enable_thinking=True,
-                        thinking_budget=min(QWEN_THINKING_BUDGET, max_output_tokens - 74))
+            budget = QWEN_DISCUSSION_THINKING_BUDGET if fast_reasoning else QWEN_THINKING_BUDGET
+            body.update(enable_thinking=True, thinking_budget=min(budget, max_output_tokens - 74))
         else:
             raise ProviderError('当前千问连接不支持所选思考模式。')
     elif connection.provider == 'kimi' and connection.model.startswith('kimi-k3'):
         if effort not in ('', 'low', 'high', 'max'):
             raise ProviderError('该 Kimi 模型需要 low、high 或 max 推理强度。')
-        body.update(reasoning_effort=effort or 'high', max_completion_tokens=max_output_tokens)
+        body.update(reasoning_effort=effort or ('low' if fast_reasoning else 'high'),
+                    max_completion_tokens=max_output_tokens)
     else:
         body['max_tokens'] = max_output_tokens
         if connection.provider == 'deepseek':
@@ -441,7 +443,8 @@ def _stream_reply(connection, payload, on_text, *, preserve_reasoning=False):
         raise ProviderError('模型流式响应格式无效；本次未标记完成。', diagnostic_code='invalid_stream') from None
 
 
-def generate_reply(messages, connection=None, *, max_output_tokens=None, system_instruction=None, on_text=None):
+def generate_reply(messages, connection=None, *, max_output_tokens=None, system_instruction=None, on_text=None,
+                   fast_reasoning=False):
     connection = _connection(connection)
     if system_instruction is not None:
         # Role invocations are fresh exchanges; never transplant private thinking
@@ -457,7 +460,7 @@ def generate_reply(messages, connection=None, *, max_output_tokens=None, system_
     response_format = _structured_hanzi_format(connection, messages)
     if response_format:
         prepared[0]['content'] += '\n' + STRUCTURED_HANZI_INSTRUCTION
-    payload = _payload(connection, prepared, max_output_tokens)
+    payload = _payload(connection, prepared, max_output_tokens, fast_reasoning=fast_reasoning)
     if response_format:
         payload['response_format'] = response_format
     try:

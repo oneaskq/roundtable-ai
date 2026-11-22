@@ -83,6 +83,8 @@ class TeamInterjection(models.Model):
     client_request_id = models.UUIDField(unique=True)
     content = models.TextField()
     target_provider = models.CharField(max_length=32, blank=True, default='')
+    reply_to_step = models.ForeignKey('AgentStep', null=True, blank=True, on_delete=models.SET_NULL,
+                                      related_name='+')
     status = models.CharField(max_length=20, default='pending')
     public_order = models.PositiveIntegerField(null=True, editable=False)
     created_at = models.DateTimeField(auto_now_add=True)

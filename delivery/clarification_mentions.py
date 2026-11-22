@@ -101,9 +101,12 @@ def _claim(item):
 
 
 def _reply_packet(item):
+    from .team_views import quoted_member_turn
     run = item.run
     packet = {'conversation': _decision_conversation(run.input_context), 'brief': run.decision_state.get('brief_draft', {}),
               'question_to_you': item.content, 'sources': run.decision_state.get('sources', [])}
+    if quoted := quoted_member_turn(item):
+        packet['reply_to'] = quoted
     earlier = list(run.interjections.filter(public_order__lt=item.public_order).order_by('public_order')
                    .values_list('content', flat=True))
     if earlier:

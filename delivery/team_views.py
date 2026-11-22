@@ -22,6 +22,8 @@ from .member_address import addressed_provider, member_connection
 from .models import AgentStep, RequestBudget, TeamRun, TeamInterjection
 from .provider import ProviderError, generate_reply
 from .planning import PlanToolsUnavailable
+from .public_research import (approved_query, declines_public_search, search_provider_name,
+                              set_automatic_search, suggested_query)
 from .team_config import (ADAPTIVE_MODE_MAX_CALLS, DECISION_MAX_CALLS, FILE_EXTRA_ROLES, MAX_OUTPUT_TOKENS,
                           MODE_MAX_CALLS, ROLES, resolve_team, select_team, team_revision, team_summary)
 from .team_engine import TeamReviewError, run_team
@@ -51,6 +53,7 @@ def _post_team_message(request, conversation_id, payload):
     try:
         run_id = uuid.UUID(payload.get('run_id', ''))
         request_id = uuid.UUID(payload.get('client_request_id', ''))
+        reply_to = uuid.UUID(payload['reply_to_step']) if payload.get('reply_to_step') else None
     except (ValueError, TypeError, AttributeError):
         return JsonResponse({'error': '消息标识无效，请刷新后重试。'}, status=400)
     content = payload.get('content')
@@ -70,7 +73,7 @@ def _post_team_message(request, conversation_id, payload):
             same_target = (existing.target_provider == target or
                            (not payload.get('target_provider') and not existing.target_provider))
             if (existing.run.task.conversation_id != conversation.id or existing.run_id != run_id
-                    or existing.content != content.strip() or not same_target):
+                    or existing.content != content.strip() or not same_target or existing.reply_to_step_id != reply_to):
                 return JsonResponse({'error': '消息标识已使用，请刷新后重试。'}, status=409)
             return JsonResponse({'accepted': True, 'id': str(existing.id), 'status': existing.status,
                                  'continuation_required': existing.status == 'pending' and
@@ -91,6 +94,12 @@ def _post_team_message(request, conversation_id, payload):
             return JsonResponse({'error': '这轮讨论已停止接收补充。', 'code': 'interjection_round_closed'}, status=409)
         if run.workflow not in ('adaptive', 'decision_v1'):
             return JsonResponse({'error': '当前协作流程不支持过程插话。'}, status=409)
+        if reply_to:
+            step = run.steps.filter(id=reply_to, provider=target, status='completed').exclude(output='').first()
+            if (not target or not step or step.role == 'planner' or
+                    (run.delivery_mode == 'files' and step.role in ('synthesizer', 'repair')) or
+                    not discussion_output(step).strip() and not run.decision_state.get('user_replies', {}).get(step.role)):
+                return JsonResponse({'error': '请回复本轮中该成员已发表的发言。'}, status=400)
         try:
             connections = run_connections(run)
         except ConnectionError:
@@ -115,7 +124,7 @@ def _post_team_message(request, conversation_id, payload):
         TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
         order = TeamRun.objects.values_list('discussion_counter', flat=True).get(pk=run.pk)
         item = TeamInterjection.objects.create(run=run, client_request_id=request_id,
-            content=content.strip(), target_provider=target, public_order=order,
+            content=content.strip(), target_provider=target, reply_to_step_id=reply_to, public_order=order,
             status='mention_queued' if waiting_mention else 'pending')
         result = {'accepted': True, 'id': str(item.id), 'status': item.status,
                   'continuation_required': continuing}
@@ -131,12 +140,38 @@ def _post_team_message(request, conversation_id, payload):
         return JsonResponse(result, status=201)
 
 
-def discussion_output(step):
+def quoted_member_turn(item):
+    """Resolve the original, published words separately from the user's question."""
+    if not item.reply_to_step_id:
+        return None
+    step = item.reply_to_step
+    if step.run.workflow == 'decision_v1' and not step.role.startswith('mention_'):
+        state = step.run.decision_state
+        ids = state.get('user_replies', {}).get(step.role, {}).get('interjection_ids', [])
+        notes = {str(key): content for key, content in step.run.interjections.filter(id__in=ids)
+                 .values_list('id', 'content')} if ids else {}
+        value = _decision_step_output(step)
+        turn = _discussion_turn(step, value, state, notes)
+        text = (turn or {}).get('text') or discussion_output(step, value)
+    else:
+        text = discussion_output(step)
+    return {'step_id': str(step.id), 'member': step.provider, 'content': text[:1600]}
+
+
+def _decision_step_output(step):
+    from .decision_team_engine import _parse
+    try:
+        return _parse(step.output, step.label)
+    except ProviderError:
+        return None
+
+
+def discussion_output(step, output=None):
     if getattr(getattr(step, 'run', None), 'workflow', '') == 'decision_v1':
         if step.role.startswith('mention_'):
             return step.output
         try:
-            value = json.loads(step.output)
+            value = _decision_step_output(step) if output is None else output
             if step.role.startswith('quick_'):
                 return str(value.get('reply', ''))
             if step.role in ('clarifier', 'clarifier_peer'):
@@ -217,34 +252,144 @@ def discussion_output(step):
         return '【模型核验原始回复，格式未识别】\n' + step.output
 
 
+def _member_turn_candidates(step, state, rows, review):
+    """Prefer findings actually accepted for this role; never infer an author from prose."""
+    participants = {p['id']: p for p in state.get('participants', []) if isinstance(p, dict) and p.get('id')}
+    extra = step.role.startswith('extra_')
+    if extra:
+        matches = [p['id'] for p in participants.values()
+                   if (p.get('provider'), p.get('model')) == (step.provider, step.model)]
+        speaker = matches[0] if len(matches) == 1 else None
+    else:
+        speaker = step.role.partition('_')[2]
+    if speaker not in participants:
+        return [(row, None) for row in rows]
+    record = (state.get('extra_round') or {}) if extra else state
+    findings = [f for f in record.get('reviews', []) if isinstance(f, dict)]
+    if review:
+        excluded = state.get('unlinked_review_counts', {}).get(step.role, 0)
+        claims = {c['id']: (a['participant'], c.get('text')) for a in state.get('analyses', [])
+                  if isinstance(a, dict) and a.get('participant') for c in a.get('claims', [])
+                  if isinstance(c, dict) and c.get('id') and c.get('author') == a['participant']}
+        checked = {(f.get('claim_id'), f.get('reason')) for f in findings if f.get('reviewer') == speaker}
+    else:
+        challenges = {f['id']: (f.get('reviewer'), f.get('reason')) for f in findings
+                      if f.get('id') and f.get('author') == speaker}
+    linked = []
+    for row in rows:
+        if review:
+            claim_id = row.get('claim_id')
+            if not isinstance(claim_id, str):
+                continue
+            key = claim_id.strip().upper()
+            # An extra review concerns one designated claim. Only its processed
+            # record establishes that an otherwise-real claim was in scope.
+            if (extra or checked or excluded) and (key, row['reason'].strip()) not in checked:
+                continue
+            source = claims.get(key)
+        else:
+            ref = row.get('finding_id')
+            source = challenges.get(ref) if isinstance(ref, str) else None
+        if source:
+            peer, source_text = source
+            person = participants.get(peer, {})
+            if peer != speaker and person.get('label') and isinstance(source_text, str) and source_text.strip():
+                linked.append((row, {'kind': 'member', 'label': person['label'], 'text': source_text}))
+    if linked or (review and excluded):
+        return linked
+    return [(row, None) for row in rows]
+
+
+def _discussion_turn(step, value, state, notes):
+    """Show one complete thought, with a reply link only when its source resolves."""
+    reply = state.get('user_replies', {}).get(step.role) or {}
+    ids = reply.get('interjection_ids')
+    if (isinstance(reply.get('text'), str) and reply['text'].strip() and isinstance(ids, list)
+            and ids and all(isinstance(key, str) and key in notes for key in ids)):
+        return {'text': reply['text'].strip(), 'detail_label': '完整发言',
+                'reply_to': {'kind': 'user', 'label': '你', 'text': '\n\n'.join(notes[key] for key in ids)}}
+    if not isinstance(value, dict):
+        return None
+    role = step.role
+    if role.startswith('analysis_'):
+        if not isinstance(value.get('claims', []), list):
+            return None
+        candidates = [value.get('recommendation')] + [
+            claim.get('text') for claim in value.get('claims') or [] if isinstance(claim, dict)]
+        text = next((s.strip() for s in candidates if isinstance(s, str) and 0 < len(s.strip()) <= 220), '')
+        return {'text': text, 'detail_label': '完整分析'}
+
+    review = role.startswith('review_') or role == 'extra_review'
+    if not review and not (role.startswith('response_') or role == 'extra_response'):
+        return None
+    rows = value.get('findings' if review else 'responses')
+    if (not isinstance(rows, list) or not rows or any(not isinstance(row, dict)
+            or not isinstance(row.get('reason'), str) or not row['reason'].strip() for row in rows)):
+        return None
+    # A complete reason retains conditions and negations. Leave exceptionally
+    # long historical reasons in the disclosure instead of cutting a sentence.
+    candidates = _member_turn_candidates(step, state, rows, review)
+    if not candidates:
+        return {'text': '', 'detail_label': f'未关联的核验原文（{len(rows)} 条）'}
+    short = [(row, ref) for row, ref in candidates if len(row['reason'].strip()) <= 220]
+    priority = 'important' if review else 'changed'
+    selected, reference = next(((row, ref) for row, ref in short if row.get(priority) is True), (short or candidates)[0])
+    text = selected['reason'].strip() if short else ''
+    turn = {'text': text, 'detail_label': ('完整核验' if review else '完整回应') + f'（{len(rows)} 条）'}
+    if not review and isinstance(selected.get('decision'), str):
+        turn['decision'] = {'accept': '接受质疑', 'reject': '不接受质疑', 'undetermined': '待确定'}.get(selected['decision'], '')
+    if reference:
+        turn['reply_to'] = reference
+    return turn
+
+
 def serialize_run(run):
     discussion = [
         {'id': str(item.id), 'kind': 'user', 'provider': '', 'role': 'user',
          'content': item.content, 'created_at': item.created_at.isoformat(),
-         'target_provider': item.target_provider, 'status': item.status, 'order': item.public_order}
+         'target_provider': item.target_provider, 'status': item.status, 'order': item.public_order,
+         **({'reply_to_step': str(item.reply_to_step_id)} if item.reply_to_step_id else {})}
         for item in run.interjections.all()
     ]
+    notes = {item['id']: item['content'] for item in discussion}
     for step in run.steps.all():
         if (step.status != 'completed' or not step.output or step.role == 'planner'
                 or (run.delivery_mode == 'files' and step.role in ('synthesizer', 'repair'))):
             continue
-        content = discussion_output(step)
+        role, label = step.role, step.label
+        output = turn = None
+        if run.workflow == 'decision_v1':
+            if role.startswith('mention_'):
+                # Live mentions and clarification mentions use different lengths
+                # of the original note's UUID when they create an AgentStep.
+                prefix = role.removeprefix('mention_')
+                addressed = [item for item in discussion if item['kind'] == 'user' and item['target_provider'] == step.provider
+                             and len(prefix) in (18, 22) and item['id'].replace('-', '').startswith(prefix)]
+                if len(addressed) == 1:
+                    turn = {'text': step.output, 'detail_label': '完整发言',
+                            'reply_to': {'kind': 'user', 'label': '你', 'text': addressed[0]['content']}}
+            else:
+                output = _decision_step_output(step)
+                turn = _discussion_turn(step, output, run.decision_state, notes)
+        content = discussion_output(step, output)
+        if isinstance(output, dict) and output.get('responses') == [] and content.startswith('最终意见：'):
+            role, label = 'opinion_update', '意见更新'
+        if turn and turn.get('reply_to', {}).get('kind') == 'user':
+            # The synthesizer's recommendation already appears in the final report.
+            if not content or role == 'synthesizer':
+                content = turn['text']
+            elif content != turn['text']:
+                content = turn['text'] + '\n\n' + content
         if not content.strip():
             continue
-        role, label = step.role, step.label
-        if run.workflow == 'decision_v1' and (role.startswith('response_') or role == 'extra_response'):
-            try:
-                output = json.loads(step.output)
-                if isinstance(output, dict) and output.get('responses') == [] and content.startswith('最终意见：'):
-                    role, label = 'opinion_update', '意见更新'
-            except (ValueError, TypeError):
-                pass  # discussion_output already supplies a traceable format warning.
         discussion.append({'id': str(step.id), 'kind': 'assistant', 'provider': step.provider,
             'role': role, 'label': label, 'model': step.model, 'content': content,
             'created_at': step.updated_at.isoformat(), 'target_provider': '', 'status': step.status,
-            'order': step.public_order})
+            'order': step.public_order, **({'turn': turn} if turn is not None else {})})
+    # Historical steps can share a timestamp. Their stored position already
+    # supplies the tie-breaker, whereas sorting UUIDs can put a reply first.
     discussion.sort(key=lambda item: (item['order'] is not None,
-        item['order'] if item['order'] is not None else item['created_at'], item['id']))
+        item['order'] if item['order'] is not None else item['created_at']))
     decision = {key: value for key, value in run.decision_state.items() if key not in ('sources', 'followup_report')}
     if run.workflow == 'decision_v1' and run.status == 'completed' and decision.get('reviews'):
         from .review_groups import matching_steps
@@ -517,7 +662,8 @@ def collaborate(request, conversation_id):
                 TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
                 order = TeamRun.objects.values_list('discussion_counter', flat=True).get(pk=run.pk)
                 TeamInterjection.objects.create(run=run, client_request_id=uuid.uuid4(),
-                    content=item.content, target_provider=item.target_provider, public_order=order)
+                    content=item.content, target_provider=item.target_provider, reply_to_step_id=item.reply_to_step_id,
+                    public_order=order)
                 item.status = 'forwarded'
                 item.save(update_fields=['status'])
         stages = ROLES + FILE_EXTRA_ROLES if mode == 'files' else ROLES
@@ -623,7 +769,6 @@ def confirm_decision_brief(request, conversation_id):
     except (ValueError, TypeError, AttributeError):
         return JsonResponse({'error': '问题说明标识无效，请刷新后重试。'}, status=400)
     from .decision_team_engine import BRIEF_FIELDS, confirm_brief
-    from .public_research import approved_query, search_provider_name
     with transaction.atomic():
         conversation = lock_conversation(request.user, conversation_id)
         run = TeamRun.objects.filter(pk=run_id, task__conversation=conversation,
@@ -653,6 +798,12 @@ def confirm_decision_brief(request, conversation_id):
             brief = confirm_brief(raw_brief, state.get('brief_draft', {}))
         except ProviderError as error:
             return JsonResponse({'error': str(error)}, status=400)
+        auto_search = request.payload.get('auto_public_search') is True and not search_query and bool(offered)
+        if auto_search and (declines_public_search(brief['answers']) or any(
+                declines_public_search(content) for content in run.interjections.values_list('content', flat=True))):
+            auto_search = False
+        if auto_search:
+            search_query = suggested_query(draft)
         if run.status != 'awaiting_input':
             saved = state.get('brief', {})
             if (saved and state.get('public_search_query', '') == search_query
@@ -663,6 +814,12 @@ def confirm_decision_brief(request, conversation_id):
             return JsonResponse({'error': '本轮问题说明已变化，请刷新后查看状态。', 'code': 'brief_stale'}, status=409)
         if request.payload.get('confirm_continue') is not True or request.payload.get('expected_max_calls') != run.max_calls:
             return JsonResponse({'error': '请确认继续本轮已说明的模型调用额度。'}, status=400)
+        if request.payload.get('resume_lookup_only') is True and (
+            request.payload.get('auto_public_search') is not True or not offered or draft.get('questions') != [] or
+            not conversational or answer or request.payload.get('public_search_query') or
+            run.interjections.filter(status__in=['pending', 'mention_queued', 'mention_running']).exists()
+        ):
+            return JsonResponse({'error': '本轮还有需要处理的补问或发言，请刷新查看。', 'code': 'lookup_resume_conflict'}, status=409)
         task = Task.objects.get(pk=run.task_id, owner=request.user)
         if task.status != 'waiting' or task.updated_at.isoformat() != state.get('waiting_task_updated_at'):
             return JsonResponse({'error': '需求已经改变，请重新开始一轮以重新整理问题。', 'code': 'brief_stale'}, status=409)
@@ -677,7 +834,9 @@ def confirm_decision_brief(request, conversation_id):
             return JsonResponse({'error': '团队连接已改变，请重新开始一轮。', 'code': 'team_changed'}, status=409)
         if current['readiness'] != 'available' or not constant_time_compare(current['revision'], run.team_revision):
             return JsonResponse({'error': '团队连接或验收状态已改变，请重新开始一轮。', 'code': 'team_changed'}, status=409)
-        if search_query:
+        if auto_search:
+            set_automatic_search(state, draft, search_query)
+        elif search_query:
             provider = search_provider_name()
             if provider != draft['public_search_provider']:
                 return JsonResponse({'error': '检索服务已变化，本次可以跳过检索。'}, status=409)
@@ -834,7 +993,8 @@ def _execute_team_run(run, *, context=None):
 
     def before_discussion(stage, public, discussion):
         nonlocal synthesis_seen
-        pending = list(run.interjections.filter(status='pending').exclude(id__in=staged_group))
+        pending = list(run.interjections.filter(status='pending').exclude(id__in=staged_group)
+                       .select_related('reply_to_step__run'))
         if pending and stage in ('verifier', 'recheck'):
             raise RunStopped('综合草稿产生后收到新消息，已保留待处理；请在下一轮继续，避免遗漏你的补充。')
         for item in pending:
@@ -851,7 +1011,12 @@ def _execute_team_run(run, *, context=None):
                      (f'，指定 {item.target_provider}' if item.target_provider else '') + '】\n' + content)}
             if entry not in public:
                 public.append(entry)
-            discussion.append({'member': '用户', 'content': content, 'target_provider': item.target_provider})
+            user_turn = {'member': '用户', 'content': content, 'target_provider': item.target_provider,
+                         'interjection_id': str(item.id)}
+            quoted = quoted_member_turn(item)
+            if quoted:
+                user_turn['reply_to'] = quoted
+            discussion.append(user_turn)
             if item.target_provider:
                 connection = member_connection(connections, item.target_provider, run.decision_state.get('participants'))
                 with transaction.atomic():
@@ -861,6 +1026,7 @@ def _execute_team_run(run, *, context=None):
                     remaining_stages = AgentStep.objects.filter(run=run, status='pending').count()
                     # Never spend a call needed by the remaining scheduled workflow.
                     if current.calls_used + remaining_stages + 1 > current.max_calls:
+                        user_turn['reply_deferred'] = True
                         staged_group.add(item.id)
                         TaskEvent.objects.create(task=task, kind='team_interjection', content=
                             '本轮剩余额度需保留给审查；点名发言已交给后续讨论，未单独调用成员回应。')
@@ -875,8 +1041,9 @@ def _execute_team_run(run, *, context=None):
                     raise RunStopped('团队讨论超过上下文上限，消息已保留，请开启新一轮。')
                 before_step(role, '回应用户', connection)
                 answer = _public_output(generate_reply([{'role': 'user', 'content': encoded}],
-                    connection=connection, max_output_tokens=MAX_OUTPUT_TOKENS,
-                    system_instruction=COMMON_INSTRUCTION + '\n用户明确点名你，请直接回应最新用户发言。'))
+                    connection=connection, max_output_tokens=MAX_OUTPUT_TOKENS, fast_reasoning=True,
+                    system_instruction=COMMON_INSTRUCTION + '\n用户明确点名你。直接回答他刚问的事，若有 reply_to，'
+                    '请接着那条真实发言中的具体观点答。一两句话说清你的判断和理由，用户要求展开时再详说。'))
                 if workflow == 'decision_v1':
                     from .decision_team_engine import reject_unperformed_action_claims
                     reject_unperformed_action_claims(answer)
@@ -1003,7 +1170,8 @@ def _execute_team_run(run, *, context=None):
                              (f'，指定 {item.target_provider}' if item.target_provider else '') + '】\n' + item.content}
                     if entry not in member_context:
                         member_context.append(entry)
-                answer = quick_member_reply(member_context, [], conn, 'quick_' + member['id'], '点名回复',
+                quoted_turns = [quoted for item in pending if (quoted := quoted_member_turn(item))]
+                answer = quick_member_reply(member_context, quoted_turns, conn, 'quick_' + member['id'], '点名回复',
                                             before_step, after_step, direct_member=member['label'],
                                             followup_report=state.get('followup_report'), sources=state.get('sources'))
                 quick_content = f'{member["label"]}：{answer}'
@@ -1017,8 +1185,8 @@ def _execute_team_run(run, *, context=None):
             elif state.get('phase') == 'drafting':
                 state['quick_disabled'] = run.interjections.filter(status='pending', target_provider='').exists()
                 draft = prepare_brief(context, connections, state, before_step, after_step)
-                if draft.get('public_search_query') or draft.get('public_search_requested'):
-                    from .public_research import search_provider_name
+                offered_search = bool(draft.get('public_search_query') or draft.get('public_search_requested'))
+                if offered_search:
                     draft['public_search_provider'] = search_provider_name()
                 if draft.get('mode') != 'quick' and draft.get('questions') and state.get('clarify_peer_enabled'):
                     first = connections['synthesizer']
@@ -1087,8 +1255,8 @@ def _execute_team_run(run, *, context=None):
                         lock_conversation(request.user, conversation_id)
                         check_active()
                         TeamRun.objects.filter(pk=run.pk, status='running').update(decision_state=state, updated_at=timezone.now())
-                elif (state.get('clarify_peer_enabled') and not draft.get('questions')
-                      and not draft.get('public_search_query') and not draft.get('public_search_requested')
+                elif ((state.get('clarify_peer_enabled') or offered_search)
+                      and not draft.get('questions')
                       and not run.interjections.filter(status='pending').exists()):
                     with transaction.atomic():
                         lock_conversation(request.user, conversation_id)
@@ -1099,6 +1267,7 @@ def _execute_team_run(run, *, context=None):
                         state['brief'].pop('confirmed_at', None)
                         state['brief_user_confirmed'] = False
                         state['phase'] = 'confirmed'
+                        set_automatic_search(state, draft, suggested_query(draft))
                         TeamRun.objects.filter(pk=run.pk, status='running').update(decision_state=state, updated_at=timezone.now())
                         TaskEvent.objects.create(task=task, kind='decision_clarification',
                             content='模型未提出必要补问，继续分析；模型整理的草稿不视为用户确认。')

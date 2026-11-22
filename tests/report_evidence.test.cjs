@@ -93,6 +93,12 @@ test('completed reviews use their checked claim and response identity rather tha
   const review = (n, equivalence) => ({run, item:{role:'review_p' + n, content:'岗位职责可从乙的录用通知中核对。', equivalence}});
   const same = [review(1, 'same'),review(2, 'same'),review(3, 'same')];
   assert.deepEqual(Array.from(ctx.renderDiscussionTimeline(same)), ['review_p1,review_p2,review_p3']);
+  const addressed = ['Kimi', '千问'].map((label, index) => {
+    const entry = review(index + 1, 'same');
+    entry.item.turn = {text:entry.item.content, reply_to:{kind:'member', label, text:'相同观点'}};
+    return entry;
+  });
+  assert.deepEqual(Array.from(ctx.renderDiscussionTimeline(addressed)), ['review_p1','review_p2']);
   for (const changed of ['different', undefined]) {
     assert.deepEqual(Array.from(ctx.renderDiscussionTimeline([same[0],review(2, changed),same[2]])),
       ['review_p1','review_p2','review_p3']);

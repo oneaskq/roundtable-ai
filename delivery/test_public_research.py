@@ -27,7 +27,7 @@ class PublicResearchTests(SimpleTestCase):
         self.assertNotIn('public_search_query', state)
 
     @patch('delivery.decision_team_engine._call')
-    def test_private_model_suggestion_is_discarded_prior_to_consent(self, call):
+    def test_private_model_suggestion_is_discarded(self, call):
         for query in ['学号：20250123 奖学金', 'user@example.org 岗位', '我叫李明 薪资']:
             call.return_value = {'goal': '查招聘信息', 'public_search_query': query}
             draft = prepare_brief([{'role': 'user', 'content': '帮我查招聘规则'}], connections(),
@@ -36,7 +36,7 @@ class PublicResearchTests(SimpleTestCase):
             self.assertTrue(draft['public_search_requested'])
 
     @patch('delivery.decision_team_engine._call')
-    def test_lookup_request_without_safe_keywords_offers_empty_field_only(self, call):
+    def test_lookup_request_without_safe_keywords_never_uses_raw_message_as_query(self, call):
         call.return_value = {'mode': 'quick', 'quick_reply': '我来看看'}
         private = '帮我查最新岗位，我的学号是 12345678'
         draft = prepare_brief([{'role': 'user', 'content': private}], connections(),
@@ -54,7 +54,7 @@ class PublicResearchTests(SimpleTestCase):
         self.assertNotIn('public_search_requested', declined)
         self.assertNotIn('public_search_query', declined)
 
-    def test_external_query_requires_explicit_consent_and_filters_obvious_identifiers(self):
+    def test_legacy_query_confirmation_rejects_unconfirmed_or_private_keywords(self):
         self.assertEqual(approved_query(None, None), '')
         self.assertEqual(approved_query('  太阳能  ', True), '太阳能')
         for value, consent in [('太阳能', False), ('太阳能', 1), ('a' * 161, True),
@@ -106,7 +106,7 @@ class PublicResearchTests(SimpleTestCase):
 
     @patch.dict(os.environ, {'BRAVE_SEARCH_API_KEY': ''})
     @patch('delivery.public_research._get_json')
-    def test_no_search_service_change_without_new_consent(self, get_json):
+    def test_lookup_does_not_switch_away_from_the_selected_search_service(self, get_json):
         info, sources = lookup_public_sources('public terms', 'Brave Search')
         self.assertEqual((info['status'], sources), ('provider_changed', []))
         get_json.assert_not_called()

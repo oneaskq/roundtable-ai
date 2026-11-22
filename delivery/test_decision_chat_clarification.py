@@ -1,7 +1,9 @@
 import json
 import uuid
 import hashlib
+import os
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -164,7 +166,7 @@ class ChatClarificationTests(TestCase):
             self.addCleanup(patcher.stop)
         self.url = f'/api/conversations/{self.conversation.id}/confirm-decision'
 
-    def start(self, peer_question='', on_peer=None):
+    def start(self, peer_question='', on_peer=None, *, clarifier=None):
         body = {'background': True, 'client_request_id': str(uuid.uuid4()), 'confirm_cost': True,
                 'expected_team': 'a' * 64, 'workflow': 'decision_v1', 'delivery_mode': 'text',
                 'expected_max_calls': 14, 'expected_task': str(self.task.id),
@@ -178,23 +180,104 @@ class ChatClarificationTests(TestCase):
             if stage == 'clarifier_peer' and on_peer:
                 on_peer()
             value = {'question': peer_question} if stage == 'clarifier_peer' else fixture(stage)
+            if stage == 'clarifier' and clarifier:
+                value.update(clarifier)
             return json.dumps(value, ensure_ascii=False)
         with patch('delivery.decision_team_engine.generate_reply', side_effect=generate):
             process_next_run()
         return TeamRun.objects.get()
 
-    def test_suggested_research_pauses_without_questions_and_needs_explicit_consent(self):
-        original = fixture
-        def suggest(stage):
-            return ({**original(stage), 'questions': [], 'public_search_query': '实习岗位要求'}
-                    if stage == 'clarifier' else original(stage))
-        with patch(__name__ + '.fixture', side_effect=suggest):
-            run = self.start()
+    @patch.dict(os.environ, {'BRAVE_SEARCH_API_KEY': ''})
+    @patch('delivery.public_research._get_json')
+    def test_public_lookup_finishes_without_confirmation_and_keeps_the_source(self, get_json):
+        query = '实习岗位要求'
+        get_json.return_value = {'query': {'pages': [{'title': '公开岗位说明', 'extract': '所需技能', 'lastrevid': 42}]}}
+        run = self.start(clarifier={'questions': [], 'public_search_query': query})
+        self.assertEqual(run.status, 'completed')
+        self.assertFalse(run.decision_state['brief_user_confirmed'])
+        get_json.assert_called_once()
+        self.assertEqual(parse_qs(urlsplit(get_json.call_args.args[0]).query)['gsrsearch'], [query])
+        research = run.decision_state['public_research']
+        self.assertEqual(research['status'], 'found')
+        url = research['sources'][0]['url']
+        self.assertTrue(url.endswith('oldid=42'))
+        self.assertIn(url, Message.objects.get(pk=run.decision_state['result_message_id']).content)
+        self.assertIsNone(process_next_run())
+        get_json.assert_called_once()
+
+    @patch.dict(os.environ, {'BRAVE_SEARCH_API_KEY': ''})
+    @patch('delivery.public_research._get_json', side_effect=TimeoutError)
+    def test_search_timeout_continues_to_a_report_with_the_limitation(self, get_json):
+        run = self.start(clarifier={'questions': [], 'public_search_query': '公开学费标准'})
+        self.assertEqual(run.status, 'completed')
+        self.assertEqual(run.decision_state['public_research']['status'], 'unavailable')
+        self.assertIn('检索未完成', Message.objects.get(pk=run.decision_state['result_message_id']).content)
+        get_json.assert_called_once()
+
+    @patch('delivery.public_research._get_json')
+    def test_no_safe_keywords_does_not_pause_or_send_the_user_message(self, get_json):
+        Message.objects.filter(conversation=self.conversation, role='user').update(content='帮我查最新实习岗位')
+        run = self.start(clarifier={'questions': [], 'public_search_query': '联系 user@example.org'})
+        self.assertEqual(run.status, 'completed')
+        get_json.assert_not_called()
+
+    @patch.dict(os.environ, {'BRAVE_SEARCH_API_KEY': ''})
+    @patch('delivery.public_research._get_json', return_value={})
+    def test_real_question_waits_for_the_answer_then_searches_automatically(self, get_json):
+        run = self.start(clarifier={'public_search_query': '实习岗位要求'})
+        self.assertEqual(run.status, 'awaiting_input')
+        get_json.assert_not_called()
+        body = {'run_id': str(run.id), 'answer': '优先成本', 'confirm_continue': True,
+                'expected_max_calls': run.max_calls, 'auto_public_search': True}
+        self.assertEqual(self.client.post(self.url, body, content_type='application/json').status_code, 202)
+        self.assertEqual(self.client.post(self.url, body, content_type='application/json').status_code, 200)
+        self.finish_waiting_run(run)
+        self.assertEqual(run.decision_state['public_research']['status'], 'empty')
+        self.assertIn('没有返回', Message.objects.get(pk=run.decision_state['result_message_id']).content)
+        get_json.assert_called_once()
+
+    @patch('delivery.public_research._get_json')
+    def test_answer_can_decline_the_automatic_search(self, get_json):
+        run = self.start(clarifier={'public_search_query': '公开岗位要求'})
+        body = {'run_id': str(run.id), 'answer': '不要联网，优先成本', 'confirm_continue': True,
+                'expected_max_calls': run.max_calls, 'auto_public_search': True}
+        self.assertEqual(self.client.post(self.url, body, content_type='application/json').status_code, 202)
+        self.finish_waiting_run(run)
+        get_json.assert_not_called()
+
+    def finish_waiting_run(self, run):
+        with patch('delivery.decision_team_engine.generate_reply',
+                   side_effect=lambda *a, **kw: json.dumps(fixture(AgentStep.objects.get(status='running').role))):
+            self.assertEqual(process_next_run(), run.id)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'completed')
+
+    @patch.dict(os.environ, {'BRAVE_SEARCH_API_KEY': ''})
+    @patch('delivery.public_research._get_json', return_value={})
+    def test_old_lookup_only_wait_resumes_once_without_skipping_real_questions(self, get_json):
+        run = self.start(clarifier={'public_search_query': '公开岗位条件'})
+        body = {'run_id': str(run.id), 'answer': '', 'expected_max_calls': run.max_calls,
+                'confirm_continue': True, 'auto_public_search': True, 'resume_lookup_only': True}
+        self.assertGreaterEqual(self.client.post(self.url, body, content_type='application/json').status_code, 400)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'awaiting_input')
+        # An older client could leave an empty question list waiting solely for lookup approval.
+        run.decision_state['brief_draft']['questions'] = []
+        run.decision_state.pop('clarification_questions', None)
+        run.save(update_fields=['decision_state'])
+        self.assertEqual(self.client.post(self.url, body, content_type='application/json').status_code, 202)
+        self.assertEqual(self.client.post(self.url, body, content_type='application/json').status_code, 200)
+        self.finish_waiting_run(run)
+        self.assertFalse(run.interjections.exists())
+        self.assertIsNone(process_next_run())
+        get_json.assert_called_once()
+
+    def test_older_client_can_still_edit_and_confirm_the_offered_query(self):
+        run = self.start(clarifier={'public_search_query': '实习岗位要求'})
         self.assertEqual(run.status, 'awaiting_input')
         draft = run.decision_state['brief_draft']
         provider = draft['public_search_provider']
         self.assertEqual(draft['public_search_query'], '实习岗位要求')
-        self.assertNotIn('public_search_query', run.decision_state)
         payload = {'run_id': str(run.id), 'answer': '', 'confirm_continue': True,
                    'expected_max_calls': run.max_calls, 'public_search_query': '公开岗位条件',
                    'public_search_provider': provider}

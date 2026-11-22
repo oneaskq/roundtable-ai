@@ -98,7 +98,7 @@ class DecisionEngineTests(TestCase):
 
     @patch('delivery.decision_team_engine.lookup_public_sources')
     @patch('delivery.decision_team_engine.generate_reply')
-    def test_only_approved_query_leaves_and_fetched_source_reaches_review(self, generate, lookup):
+    def test_only_selected_public_keywords_leave_and_fetched_source_reaches_review(self, generate, lookup):
         def generated(messages, **kwargs):
             self.packets[self.stage] = json.loads(messages[0]['content'])
             value = fixture(self.stage)
@@ -126,7 +126,7 @@ class DecisionEngineTests(TestCase):
 
     @patch('delivery.decision_team_engine.lookup_public_sources')
     @patch('delivery.decision_team_engine.generate_reply')
-    def test_ignoring_a_proposed_query_sends_no_request(self, generate, lookup):
+    def test_legacy_skipped_lookup_remains_skipped_during_execution(self, generate, lookup):
         generate.side_effect = self.generator
         self.prepared()
         self.state['brief_draft']['public_search_query'] = '建议但未获授权'
@@ -207,6 +207,83 @@ class DecisionEngineTests(TestCase):
         run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
         self.assertEqual({f['verdict'] for f in self.state['reviews']}, {'unverified'})
         self.assertEqual(self.state['evidence'], [])
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_reviews_link_only_to_eligible_peers_without_losing_other_findings(self, generate):
+        def generated(messages, **kwargs):
+            self.packets[self.stage] = json.loads(messages[0]['content'])
+            value = fixture(self.stage, extra=True)
+            if self.stage == 'review_p1':
+                valid = value['findings'][0]
+                value['findings'] = [{'claim_id': 'P1C1', 'reason': '不可采用的自我质疑'},
+                                     {'claim_id': ['P3C1']}, {**valid, 'claim_id': ' p2c1 '}]
+            if self.stage == 'extra_review':
+                value['findings'].insert(0, {'claim_id': 'P3C1', 'reason': '偏离本次追加核验'})
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        p1, p2, p3 = [p['label'] for p in self.state['participants']]
+        self.assertEqual(self.packets['review_p1']['review_targets'], {'P2C1': p2, 'P3C1': p3})
+        self.assertEqual(self.packets['response_p2']['response_targets'], {'R1': p1})
+        self.assertEqual(self.state['unlinked_review_counts'], {'review_p1': 2, 'extra_review': 1})
+        self.assertEqual([(f['id'], f['claim_id']) for f in self.state['reviews']],
+                         [('R1', 'P2C1'), ('R2', 'P3C1'), ('R3', 'P1C1')])
+        self.assertEqual(self.packets['extra_review']['review_targets'], {'P1C1': p1})
+        self.assertEqual([f['id'] for f in self.state['extra_round']['reviews']], ['R4'])
+        self.assertNotIn('不可采用的自我质疑', json.dumps(self.packets['synthesizer'], ensure_ascii=False))
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_user_question_reaches_next_member_if_first_omits_reply(self, generate):
+        def interject(stage, public, history):
+            if stage == 'review_p1':
+                for key, text, target, deferred in [('a', '如果我只能周末做呢？', '', False),
+                        ('b', '已经点名并且回答过的问题', 'deepseek', False), ('c', '预算也减半', 'kimi', True)]:
+                    public.append({'role': 'user', 'content': text})
+                    history.append({'member': '用户', 'content': text, 'interjection_id': key,
+                                    'target_provider': target, 'reply_deferred': deferred})
+
+        def generated(messages, **kwargs):
+            self.packets[self.stage] = json.loads(messages[0]['content'])
+            value = fixture(self.stage)
+            if self.stage != 'review_p1':
+                value['user_reply'] = '那周末先用一半预算试一次。'
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None,
+                     before_discussion=interject)
+        stages = [stage for stage, packet in self.packets.items() if 'new_user_messages' in packet]
+        self.assertEqual(stages, ['review_p1', 'review_p2'])
+        for stage in stages:
+            self.assertEqual([msg['interjection_id'] for msg in self.packets[stage]['new_user_messages']], ['a', 'c'])
+        self.assertEqual(self.state['user_replies'], {
+            'review_p2': {'text': '那周末先用一半预算试一次。', 'interjection_ids': ['a', 'c']}})
+        self.assertEqual(len(self.calls), 11)
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_unlinked_reviews_and_unanswered_synthesis_remain_explicitly_unresolved(self, generate):
+        def interject(stage, public, history):
+            if stage == 'synthesizer':
+                public.append({'role': 'user', 'content': '预算能否再减半？'})
+                history.append({'member': '用户', 'content': '预算能否再减半？', 'interjection_id': 'last'})
+
+        def generated(messages, **kwargs):
+            value = fixture(self.stage)
+            if self.stage.startswith('review_'):
+                value['findings'] = [{'claim_id': '不存在'}]
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None,
+                     before_discussion=interject)
+        self.assertEqual(self.state['phase'], 'completed')
+        self.assertEqual(self.state['reviews'], [])
+        self.assertEqual(self.state['responses'], [])
+        self.assertNotIn('未提出', self.state['stop_reason'])
+        self.assertIn('未能对应', self.state['stop_reason'])
+        self.assertFalse(self.state.get('user_replies'))
+        self.assertTrue(any('1 条用户插话未收到直接答复' in note for note in self.state['unresolved']))
 
     @patch('delivery.decision_team_engine.generate_reply')
     def test_exact_quote_without_applicable_scope_does_not_validate_a_claim(self, generate):
@@ -369,6 +446,17 @@ class DecisionEngineTests(TestCase):
 
 
 class DecisionWorkflowTests(TestCase):
+    def test_member_reply_quotes_the_visible_finding_even_at_the_end_of_a_long_review(self):
+        from types import SimpleNamespace
+        from .team_views import quoted_member_turn
+        findings = [{'reason': '待核算的支出很长。' * 80} for _ in range(5)]
+        findings.append({'reason': '这笔预算漏了交通费。', 'important': True})
+        step = SimpleNamespace(id=uuid.uuid4(), role='review_p1', label='交叉核验', provider='kimi',
+                               run=SimpleNamespace(workflow='decision_v1', decision_state={}),
+                               output=json.dumps({'findings': findings}, ensure_ascii=False))
+        quote = quoted_member_turn(SimpleNamespace(reply_to_step_id=step.id, reply_to_step=step))
+        self.assertEqual(quote, {'step_id': str(step.id), 'member': 'kimi', 'content': '这笔预算漏了交通费。'})
+
     def setUp(self):
         self.user = get_user_model().objects.create_user(email='decision@example.test', password='ExamplePass123!')
         self.other = get_user_model().objects.create_user(email='other@example.test', password='ExamplePass123!')
@@ -560,11 +648,19 @@ class DecisionWorkflowTests(TestCase):
             self.packets[step.role] = json.loads(messages[0]['content'])
             if step.role == 'response_p3' and not sent:
                 sent = True
+                published = AgentStep.objects.get(run=step.run, role='analysis_p3', status='completed')
                 payload = {'run_id': str(step.run_id), 'content': '请千问说明预算', 'target_provider': 'qwen',
+                           'reply_to_step': str(published.id),
                            'client_request_id': str(uuid.uuid4())}
-                response = self.client.post(f'/api/conversations/{self.conversation.id}/team-messages',
-                                            json.dumps(payload), content_type='application/json')
+                url = f'/api/conversations/{self.conversation.id}/team-messages'
+                for invalid in (step.id, uuid.uuid4(), AgentStep.objects.get(run=step.run, role='analysis_p2').id):
+                    self.assertEqual(self.client.post(url, json.dumps({**payload, 'reply_to_step': str(invalid)}),
+                                                      content_type='application/json').status_code, 400)
+                response = self.client.post(url, json.dumps(payload), content_type='application/json')
                 self.assertEqual(response.status_code, 201)
+                self.assertEqual(self.client.post(url, json.dumps(payload), content_type='application/json').status_code, 200)
+                self.assertEqual(self.client.post(url, json.dumps({**payload, 'reply_to_step': None}),
+                                                  content_type='application/json').status_code, 409)
             return json.dumps(fixture(step.role), ensure_ascii=False)
         generate.side_effect = generated
         self.submit()
@@ -576,6 +672,11 @@ class DecisionWorkflowTests(TestCase):
         self.assertEqual((run.status, run.calls_used), ('completed', 13))
         self.assertEqual(TeamInterjection.objects.get().status, 'answered')
         self.assertEqual(mention.call_count, 1)
+        turn = json.loads(mention.call_args.args[0][0]['content'])['discussion'][-1]
+        self.assertEqual(turn['reply_to']['member'], 'qwen')
+        self.assertIn('p3 的条件建议', turn['reply_to']['content'])
+        self.assertEqual(turn['content'], '请千问说明预算')
+        self.assertNotIn('reply_to', self.packets['analysis_p1'])
         self.assertEqual(self.packets['analysis_p1'], self.packets['analysis_p3'])
         discussion = export_data(self.user)['team_runs'][0]['discussion']
         self.assertTrue(any(item['content'] == '点名成员的模拟回应' for item in discussion))

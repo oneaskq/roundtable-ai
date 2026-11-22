@@ -11,7 +11,7 @@ test('chat attributes each analysis to its actual assignment and handles old rou
     return {tag, ...props, children: children.filter(Boolean), append() {}, addEventListener() {}};
   }
   const ctx = {el, providerName: x => x, dateText: () => '', teamChatAvatar: () => el('aside', {}),
-    messageIcon: () => el('svg', {}), window: {}, document: {createTextNode: x => x}};
+    messageIcon: () => el('svg', {}), memberReplyActions: () => [], window: {}, document: {createTextNode: x => x}};
   vm.runInNewContext(source, ctx);
   const run = {decision: {participants: [
     {id: 'p2', assignment: {label: '成本与投入', task: '核对机会成本'}},

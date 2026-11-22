@@ -785,6 +785,10 @@ dialog::backdrop { background:#0000003d; backdrop-filter:none; }
 @media (pointer:coarse) { .message-action { min-width:36px; min-height:36px; } }
 .message-action:hover { background:#efefef; color:#252525; }
 .message-action:focus-visible { outline-offset:1px; }
+.member-reply-action { width:auto; padding:0 7px; margin-left:3px; font-size:12px; color:#525252; vertical-align:middle; }
+.member-reply-context { display:flex; align-items:center; gap:6px; width:fit-content; max-width:100%; margin:0 0 5px; padding:2px 4px 2px 8px; border-left:2px solid #999; font-size:13px; color:#393939; }
+.member-reply-context[hidden] { display:none; }
+.member-reply-context button { border:0; background:transparent; padding:2px 6px; min-height:24px; color:inherit; }
 .conversation-heading { position:sticky; top:0; z-index:22; background:#fff; }
 .conversation-menu,.report-menu { position:relative; flex:none; }
 .conversation-menu > summary,.report-menu > summary { display:flex; align-items:center; justify-content:center; width:34px; height:34px; border-radius:6px; cursor:pointer; list-style:none; font-size:20px; line-height:1; color:#686868; }
@@ -827,8 +831,12 @@ dialog::backdrop { background:#0000003d; backdrop-filter:none; }
   0%,70%,100% { opacity:.38; transform:translateY(0); }
   35% { opacity:1; transform:translateY(-2px); }
 }
-.team-chat-bubble .analysis-excerpts { margin:0; padding-inline-start:1.15em; }
-.analysis-excerpts li + li { margin-top:.35em; }
+.turn-reference { margin-bottom:4px; }
+.turn-reference summary { width:fit-content; color:#525252; cursor:pointer; font-size:13px; }
+.turn-reference blockquote { margin:4px 0 8px; padding:3px 12px; border-inline-start:2px solid #dedede; color:#454545; }
+.turn-reference summary:focus-visible { outline:2px solid currentColor; outline-offset:2px; }
+.turn-decision { margin-inline-end:.65em; color:#525252; font-size:.85em; }
+.messages > .team-chat-message .team-chat-bubble .discussion-turn-text { margin:0; }
 .team-chat-bubble .full-analysis { margin-top:4px; }
 .full-analysis summary { width:fit-content; min-height:32px; align-content:center; cursor:pointer; color:#535353; font-size:13px; }
 .full-analysis summary:focus-visible { outline:2px solid currentColor; outline-offset:2px; border-radius:3px; }

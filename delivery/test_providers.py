@@ -310,6 +310,24 @@ class ProviderTransportTests(SimpleTestCase):
                 generate_reply(self.messages, selected)
         self.opener.assert_not_called()
 
+    def test_discussion_defaults_respect_explicit_effort_and_other_model_modes(self):
+        kimi = replace(self.connection, provider='kimi', model='kimi-k3.1-pro')
+        for effort, fast, expected in [('', False, 'high'), ('', True, 'low'), ('high', True, 'high'), ('max', True, 'max')]:
+            with self.subTest(effort=effort, fast=fast):
+                generate_reply(self.messages, replace(kimi, reasoning_effort=effort), fast_reasoning=fast)
+                self.assertEqual(self.payload()['reasoning_effort'], expected)
+
+        qwen = ProviderConnection('qwen', 'qwen3.7-plus', 'synthetic-qwen-key', 'cn-beijing', '', 'bailian')
+        for connection in [qwen, replace(kimi, model='kimi-k2.6'), replace(self.connection, reasoning_effort='high')]:
+            with self.subTest(model=connection.model):
+                generate_reply(self.messages, connection)
+                usual = self.payload()
+                generate_reply(self.messages, connection, fast_reasoning=True)
+                self.assertEqual(self.payload(), usual)
+
+        generate_reply(self.messages, replace(qwen, reasoning_effort='low'), max_output_tokens=256, fast_reasoning=True)
+        self.assertEqual(self.payload()['thinking_budget'], 182)
+
     def test_models_discovery_is_get_without_generation_or_model_selection(self):
         self.set_response({'data': [{'id': 'available-a'}, {'id': 'available-b'}, {'id': 'available-a'}]})
         for provider, endpoint in [('deepseek', 'https://api.deepseek.com/v1/models'),

@@ -8,11 +8,13 @@ const script = fs.readFileSync(path.join(__dirname, '../static/app.js'), 'utf8')
 const getRun = script.slice(script.indexOf('function interjectionRun('), script.indexOf('function renderInterjectionControls('));
 const send = script.slice(script.indexOf('async function sendInterjection('), script.indexOf('function decisionRecord('));
 const clarify = script.slice(script.indexOf('async function submitClarification('), script.indexOf('async function requestReply('));
+const lookupWait = script.slice(script.indexOf('function lookupOnlyWait('), script.indexOf('function monitoringCurrent('));
+const monitor = script.slice(script.indexOf('function resumeReplyMonitoring('), script.indexOf('function replyContextCurrent('));
 
 function setup(store = new Map()) {
   const run = {id: 'round', status: 'running', workflow: 'decision_v1'};
-  const input = {value: '补充条件'};
-  const target = {value: ''};
+  const input = {value: '补充条件', focus() { this.focused = true; }};
+  const target = {value: '', options: [{value: ''}, {value: 'kimi'}, {value: 'qwen'}]};
   const state = {user: {id: 'u'}, view: 'roundtable', authVersion: 1, viewVersion: 1, conversation: {id: 'chat'},
     teamChatDrafts: new Map(), teamChatSending: new Map(), drafts: new Map(), replyFeedback: {}};
   const calls = [];
@@ -24,9 +26,10 @@ function setup(store = new Map()) {
     crypto: {randomUUID: () => String(++serial)},
     renderInterjectionControls() {}, renderModelControls() {}, rememberDraft() {}, forgetDraft() {},
     resizeComposer() {}, showToast() {}, reloadConversation: async () => {},
+    pendingSubmission: () => null, memberReplyPending: () => false,
     api: (url, args) => { calls.push({url, body: args.body}); return new Promise(resolve => { finish = resolve; }); }
   });
-  vm.runInContext(getRun + send + clarify, ctx);
+  vm.runInContext(getRun + send + clarify + lookupWait + monitor, ctx);
   return {ctx, run, input, state, target, calls, ack: () => finish({accepted: true})};
 }
 
@@ -75,6 +78,36 @@ test('refresh after lost acknowledgement preserves the request, recipient and or
   assert.equal(store.size, 0);
 });
 
+test('replying to a published remark keeps the draft and sends its real reference only on submit', async () => {
+  const store = new Map();
+  const env = setup(store);
+  env.ctx.selectMemberReply(env.run.id, 'kimi', 'published-step');
+  assert.equal(env.calls.length, 0);
+  assert.equal(env.input.focused, true);
+  assert.equal(env.target.value, 'kimi');
+  assert.equal(env.input.value, '补充条件');
+  void env.ctx.sendInterjection(env.run, env.input.value);
+  const request = env.calls[0].body;
+  assert.equal(request.reply_to_step, 'published-step');
+  assert.equal(request.target_provider, 'kimi');
+  const fresh = setup(store);
+  fresh.ctx.selectMemberReply(fresh.run.id, 'qwen', 'different-step');
+  const retry = fresh.ctx.sendInterjection(fresh.run, fresh.input.value);
+  assert.deepEqual({...fresh.calls[0].body}, {...request});
+  fresh.ack(); await retry;
+});
+
+test('stale and unavailable reply buttons cannot point the draft at a different round or member', () => {
+  const env = setup();
+  env.ctx.selectMemberReply('older-round', 'kimi', 'older-step');
+  env.ctx.selectMemberReply(env.run.id, 'unavailable', 'wrong-step');
+  env.run.status = 'completed';
+  env.ctx.selectMemberReply(env.run.id, 'kimi', 'old-step');
+  assert.equal(env.ctx.interjectionDraft(), null);
+  assert.equal(env.target.value, '');
+  assert.equal(env.calls.length, 0);
+});
+
 test('a lost interjection acknowledgement never becomes a clarification answer', () => {
   const {ctx, run, input} = setup();
   ctx.saveInterjectionDraft('chat', {runId: run.id, target: '', text: input.value, receipt: 'pending'});
@@ -92,8 +125,37 @@ test('replaying a clarification after reload uses the original confirmation endp
   const saved = fresh.ctx.interjectionDraft();
   assert.equal(saved.kind, 'clarification');
   const retry = fresh.ctx.submitClarification(fresh.input.value, {id: saved.runId, max_calls: saved.maxCalls});
+  assert.equal(old.calls[0].body.auto_public_search, true);
   assert.deepEqual({...fresh.calls[0].body}, {...old.calls[0].body});
   assert.equal(fresh.calls[0].url, '/api/conversations/chat/confirm-decision');
   fresh.ack(); await retry;
   assert.equal(store.size, 0);
+});
+
+test('opening an old lookup-only wait resumes once and leaves an unsent answer untouched', () => {
+  const {ctx, run, input, calls, ack} = setup();
+  run.status = 'awaiting_input';
+  run.max_calls = 14;
+  run.decision = {brief_draft: {public_search_query: '公开岗位要求', questions: []}};
+  ctx.resumeReplyMonitoring();
+  ctx.resumeReplyMonitoring();
+  assert.equal(calls.length, 1);
+  assert.deepEqual({...calls[0].body}, {run_id: run.id, answer: '', confirm_continue: true,
+    expected_max_calls: 14, auto_public_search: true, resume_lookup_only: true});
+  assert.equal(input.value, '补充条件');
+  ack();
+});
+
+test('a real question, a pending team message, or an unacknowledged answer prevents automatic resume', () => {
+  const {ctx, run, calls} = setup();
+  run.status = 'awaiting_input';
+  run.decision = {brief_draft: {public_search_requested: true, questions: ['什么时候决定？']}};
+  ctx.resumeReplyMonitoring();
+  run.decision.brief_draft.questions = [];
+  run.discussion = [{kind: 'user', status: 'mention_queued'}];
+  ctx.resumeReplyMonitoring();
+  run.discussion = [];
+  ctx.saveInterjectionDraft('chat', {runId: run.id, kind: 'clarification', text: '一周之内', receipt: 'old-request'});
+  ctx.resumeReplyMonitoring();
+  assert.deepEqual(calls, []);
 });

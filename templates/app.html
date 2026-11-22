@@ -8,17 +8,17 @@
   <meta name="theme-color" content="#ffffff">
   <meta name="referrer" content="no-referrer">
   <title>圆桌 · 把目标交给团队</title>
-  <link rel="stylesheet" href="{% static 'app.css' %}?v=workspace-nav-1">
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=dialogue-turns-1">
   <link rel="icon" type="image/svg+xml" href="{% static 'favicon.svg' %}">
   <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=quiet-surfaces-1">
   <script src="{% static 'report-followup.js' %}?v=1" defer></script>
   <script src="{% static 'message-format.js' %}?v=0.20-citations" defer></script>
   <script src="{% static 'sources.js' %}?v=0.20-first-message" defer></script>
-  <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=quiet-surfaces-1">
+  <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=auto-lookup-1">
   <script src="{% static 'discussion-timing.js' %}?v=2" defer></script>
-  <script src="{% static 'discussion-presentation.js' %}?v=1" defer></script>
+  <script src="{% static 'discussion-presentation.js' %}?v=dialogue-turns-1" defer></script>
   <script src="{% static 'delivery-intent.js' %}?v=1" defer></script>
-  <script src="{% static 'app.js' %}?v=workspace-nav-1" defer></script>
+  <script src="{% static 'app.js' %}?v=dialogue-turns-1" defer></script>
 </head>
 <body>
   <div class="csrf-holder" hidden>{% csrf_token %}</div>
@@ -89,12 +89,6 @@
         <div id="messages" class="messages" aria-live="polite"></div>
         <article id="live-draft" class="message assistant live-draft" hidden><p id="live-draft-label" class="live-draft-label"></p><div id="live-draft-content" class="message-content" aria-live="off"></div></article>
         <div id="reply-feedback" class="reply-feedback" role="status" aria-live="polite" hidden><p id="reply-feedback-text"></p><div class="reply-actions"><button type="button" id="request-reply" class="button">开始协作</button><button type="button" id="skip-clarification" class="text-button" hidden>暂不回答，继续讨论</button><button type="button" id="retry-pending-submission" class="button" hidden>继续同一次提交</button><button type="button" id="stop-waiting" class="text-button" hidden>停止等待</button><button type="button" id="refresh-conversation" class="text-button">刷新状态</button></div></div>
-        <section id="lookup-offer" class="lookup-offer" aria-label="本轮资料检索" hidden>
-          <label for="lookup-query">团队建议查证 <span id="lookup-provider"></span></label>
-          <input id="lookup-query" type="text" maxlength="160" autocomplete="off" placeholder="输入可公开的检索关键词" aria-describedby="lookup-note">
-          <small id="lookup-note">确认后，仅将框内关键词发给检索服务，并读取公开来源。</small>
-          <button type="button" class="button" id="lookup-continue">查资料并继续</button>
-        </section>
         <section id="team-progress" class="team-progress" aria-label="团队协作进度" hidden>
           <div class="team-wait-line">
             <span id="team-wait-mark" class="team-wait-mark" aria-hidden="true" hidden><i></i><i></i><i></i></span>
@@ -110,6 +104,10 @@
           <section id="ai-consent" class="ai-consent" aria-label="确认使用 AI 团队" hidden><p id="ai-consent-text"></p><div class="consent-actions"><button id="ai-consent-cancel" class="text-button" type="button">取消</button><button id="ai-consent-save" class="text-button" type="submit" form="composer" hidden>仅保存</button><button id="ai-consent-confirm" class="button primary" type="button">确认并开始讨论</button></div></section>
           <form id="composer" class="composer">
             <div id="source-chips" class="source-chips" aria-label="本轮参考材料" hidden></div>
+            <div id="member-reply-context" class="member-reply-context" hidden>
+              <span id="member-reply-label" aria-live="polite"></span>
+              <button id="member-reply-clear" type="button" aria-label="取消点名，发给全体成员">×</button>
+            </div>
             <label class="sr-only" for="message-input">向圆桌交代目标</label><textarea id="message-input" rows="2" maxlength="12000" placeholder="向圆桌提问，或交代一个目标" aria-describedby="composer-hint composer-count" required></textarea>
             <div class="composer-bottom">
               <button id="sources-open" class="icon-button sources-open" type="button" aria-label="添加材料" aria-haspopup="dialog" aria-controls="sources-dialog" title="添加或查看参考材料" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>

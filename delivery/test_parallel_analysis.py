@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import uuid
+from dataclasses import replace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -23,6 +24,35 @@ class ParallelAnalysisTests(SimpleTestCase):
         self.state = make_state(self.team, [])
         self.state.update(phase='confirmed', brief={'goal': '比较方案', 'unknowns': '', 'assumptions': ''})
         self.main_thread = threading.get_ident()
+
+    def test_serial_and_parallel_discussions_use_fast_member_calls_and_full_synthesis(self):
+        kimi = replace(self.team['challenger'], model='kimi-k3.1-pro')
+        qwen = replace(self.team['reviewer'], model='qwen3.7-plus', reasoning_effort='low', service_platform='bailian')
+        team = dict(self.team, challenger=kimi, reviewer=qwen, verifier=kimi, synthesizer=qwen)
+
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel):
+                state = make_state(team, [])
+                state.update(phase='confirmed', brief=self.state['brief'].copy())
+                stages, payloads = {}, {}
+
+                def before(stage, label, connection):
+                    stages[connection.model] = stage
+
+                def transport(connection, endpoint, payload, **kwargs):
+                    stage = stages[connection.model]
+                    payloads[stage] = payload
+                    message = {'role': 'assistant', 'content': json.dumps(fixture(stage), ensure_ascii=False)}
+                    return {'choices': [{'finish_reason': 'stop', 'message': message}]}
+
+                with patch('delivery.provider._request', side_effect=transport):
+                    run_decision([{'role': 'user', 'content': '比较方案'}], team, state,
+                                 before, lambda *_: None, lambda _: None, parallel_analysis=parallel)
+                self.assertEqual(state['phase'], 'completed')
+                for stage in ('analysis', 'review', 'response'):
+                    self.assertEqual(payloads[stage + '_p2']['reasoning_effort'], 'low')
+                    self.assertEqual(payloads[stage + '_p3']['thinking_budget'], 512)
+                self.assertEqual(payloads['synthesizer']['thinking_budget'], 2048)
 
     def test_three_requests_overlap_and_share_frozen_input(self):
         barrier = threading.Barrier(3, timeout=2)
