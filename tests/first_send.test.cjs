@@ -15,6 +15,8 @@ function setup({loseAck = false, beforeResponse} = {}) {
   const nodes = new Map(), storage = new Map(), posts = [], runs = [];
   const state = {user:{id:'user1'}, view:'roundtable', viewVersion:1, authVersion:1, messages:[], tasks:[],
     messageSaveIds:new Map(), drafts:new Map(), replyFeedback:{}, conversation:null, aiConsentFor:null};
+  state.capabilities = {team:{revision:'team', default_member_ids:['a','b'],
+    members:[{id:'a',ready:true},{id:'b',ready:true}]}};
   function $(key) {
     if (!nodes.has(key)) nodes.set(key, {value:'', listeners:{}, focus(){},
       addEventListener(type, callback) { this.listeners[type] = callback; },
@@ -29,7 +31,7 @@ function setup({loseAck = false, beforeResponse} = {}) {
     sessionStorage:{getItem:k=>storage.get(k) || null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
     requestReply: () => runs.push(state.conversation?.id), interjectionRun:()=>null, interjectionDraft:()=>null, pendingSubmission:()=>null,
     currentTask:()=>state.tasks[0], allTeamRuns:()=>state.tasks.flatMap(task=>task.runs || []),
-    chatAvailable:()=>true, modelIdentity:()=>[state.deliveryMode, state.conversation?.sources_revision || 'team'].join(':'),
+    modelIdentity:()=>[state.deliveryMode, state.conversation?.sources_revision || 'team'].join(':'),
     sourcesUI:{getState:()=>({busy:false})}, modelName:()=>'Test A、Test B', deliveryLimit:()=>14,
     renderChat:noop,renderModelControls:noop,resizeComposer:noop,rememberConversation:noop,
     rememberDraft:noop,forgetDraft:noop,reloadConversation:async()=>{},refreshWorkspace:async()=>{},showToast:noop,
@@ -42,15 +44,16 @@ function setup({loseAck = false, beforeResponse} = {}) {
     }});
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../static/delivery-intent.js'), 'utf8'), c);
   vm.runInContext(section('function deliveryLimit(', 'function providerName('), c);
-  vm.runInContext(section('function hasTeamConsent()', 'function chatAvailable()'), c);
+  vm.runInContext(section('function hasTeamConsent()', 'function renderParticipantOptions('), c);
   vm.runInContext(section('function closeAiConsent()', 'function pendingDraftKey('), c);
   vm.runInContext(section('function promptAIConsent(', '$("#refresh-connection").addEventListener'), c);
+  vm.runInContext(section('$("#request-reply").addEventListener', '$("#skip-clarification").addEventListener'), c);
   vm.runInContext(section('$("#composer").addEventListener("submit"', '$("#pause-task").addEventListener'), c);
   const pagehide = app.indexOf('window.addEventListener("pagehide"');
   vm.runInContext(app.slice(app.lastIndexOf('$("#message-input").addEventListener("input"', pagehide), pagehide), c);
   const confirm = async () => { $('#ai-consent-confirm').listeners.click(); await requested; };
   $('#message-input').value = '比较两份实习说明';
-  return {state,$,posts,runs,submit,confirm};
+  return {state,$,posts,runs,submit,confirm,context:c};
 }
 test('cancel preserves question and attachments; save only never starts a run', async () => {
   const f = setup();
@@ -82,6 +85,63 @@ test('asking for a downloadable file in chat uses file collaboration and its cos
   assert.equal(f.state.deliveryMode, 'text');
   assert.match(f.$('#ai-consent-text').textContent, /14 次/);
   assert.equal(f.posts.length, 1);
+});
+test('an exhausted hour saves the question once and a later explicit start uses that same question', async () => {
+  const f = setup();
+  f.state.capabilities.hourly_budget = {remaining:0, resets_at:new Date(Date.now() + 60000).toISOString()};
+  await f.submit();
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].body.content, '比较两份实习说明');
+  assert.deepEqual(f.runs, []);
+  assert.ok(!f.state.pendingConsent);
+  f.$('#request-reply').listeners.click();
+  assert.ok(!f.state.pendingConsent);
+
+  f.state.capabilities.hourly_budget.resets_at = new Date(Date.now() - 1000).toISOString();
+  f.$('#request-reply').listeners.click();
+  assert.equal(f.state.consentAction, 'saved');
+  assert.deepEqual(f.runs, []);
+  await f.confirm();
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual(f.runs, [f.state.conversation.id]);
+});
+test('quota used up during a confirmed save does not start a new discussion', async () => {
+  const f = setup({beforeResponse() {
+    f.state.capabilities.hourly_budget = {remaining:0, resets_at:new Date(Date.now() + 60000).toISOString()};
+  }});
+  await f.submit();
+  await f.confirm();
+  assert.equal(f.posts.length, 1);
+  assert.deepEqual(f.runs, []);
+  f.$('#message-input').value = '把新条件也保存下来';
+  await f.submit();
+  assert.equal(f.posts[1].url, '/api/conversations/' + f.state.conversation.id);
+  assert.deepEqual(f.runs, []);
+});
+test('the saved start button becomes available at reset without starting a run', () => {
+  const {state, $, runs, context} = setup();
+  state.conversation = {id:'saved'};
+  state.tasks = [{id:'t',status:'waiting'}];
+  $('#reply-feedback').classList = {toggle(){}};
+  vm.runInContext(section('function renderReplyFeedback()', 'function stopReplyWaiting('), context);
+  context.renderModelControls = context.renderReplyFeedback;
+  let now = Date.now();
+  context.Date = class extends Date { static now() { return now; } };
+  let expire;
+  context.clearTimeout = () => {};
+  context.setTimeout = (callback, delay) => {
+    expire = () => { now += delay; callback(); };
+    return 1;
+  };
+  vm.runInContext(section('let hourlyBudgetTimer;', 'async function refreshCapabilities('), context);
+  context.applyCapabilities({...state.capabilities, hourly_budget:{remaining:0, resets_at:new Date(now + 5000).toISOString()}});
+  assert.equal($('#request-reply').hidden, false);
+  assert.equal($('#request-reply').disabled, true);
+  assert.match($('#reply-feedback-text').textContent, /问题已保存.*额度恢复/);
+  expire();
+  assert.equal($('#request-reply').disabled, false);
+  assert.match($('#reply-feedback-text').textContent, /可以开始团队协作/);
+  assert.deepEqual(runs, []);
 });
 test('changing text, materials, or conversation invalidates the confirmation', async () => {
   for (const change of ['text','sources','conversation','view']) {

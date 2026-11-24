@@ -195,7 +195,8 @@
       if (title) {
         section = title[1] === "##" ? title[2] : "";
         const element = node(`h${title[1].length}`);
-        appendInline(element, title[2].replace(/\s+#+\s*$/, ""));
+        const label = references && section === "重要分歧与核验" ? "成员核验记录" : title[2].replace(/\s+#+\s*$/, "");
+        appendInline(element, label);
         result.append(element); index++; continue;
       }
       if (rule(line)) { result.append(node("hr")); index++; continue; }
@@ -236,8 +237,24 @@
   }
 
   window.RoundtableMessage = Object.freeze({
-    render(text, decision = null) {
-      return blocks(String(text ?? "").replace(/\r\n?/g, "\n").split("\n"), 0, decision ? reportSources(decision) : null);
+    render(text, decision = null, expanded = false) {
+      const source = String(text ?? "").replace(/\r\n?/g, "\n");
+      const references = decision ? reportSources(decision) : null;
+      const recommendation = decision?.summary?.recommendation;
+      if (typeof recommendation === "string" && recommendation.trim()) {
+        const advice = recommendation.replace(/\r\n?/g, "\n").trim();
+        const lead = "## 当前建议与条件\n" + advice;
+        // Only fold the remainder when the saved advice matches this message.
+        if (source.startsWith(lead + "\n\n") && source.slice(lead.length).trim()) {
+          const result = blocks(advice.split("\n"));
+          const detail = node("details", "report-details");
+          detail.open = expanded;
+          detail.append(node("summary", "", "查看完整报告"), blocks(source.slice(lead.length).split("\n"), 0, references));
+          result.append(detail);
+          return result;
+        }
+      }
+      return blocks(source.split("\n"), 0, references);
     },
   });
 })();

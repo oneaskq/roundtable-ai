@@ -57,11 +57,16 @@ class ComparisonTests(SimpleTestCase):
         keys = matching_steps(state, steps)
         self.assertEqual(len({keys['review_' + p['id']] for p in state['participants']}), 1)
         self.assertEqual(len({keys['response_' + p['id']] for p in state['participants']}), 1)
-        links = [r for r in report_references(state) if r['section'] == '重要分歧与核验']
+        self.assertIn('## 成员核验记录', result)
+        links = [r for r in report_references(state) if r['section'] == '成员核验记录']
         grouped = next(r for r in links if r['line'] in result)
         self.assertEqual(grouped['ids'], ['E1'])
         self.assertEqual(len(links), 4)  # Three original archived lines and the exact grouped line.
         self.assertTrue(all(p['label'] in grouped['line'] for p in state['participants']))
+        archived = deepcopy(state)
+        archived.pop('review_section_title')
+        self.assertIn('## 重要分歧与核验', render_result(archived))
+        self.assertIn({**grouped, 'section': '重要分歧与核验'}, report_references(archived))
         for section, field, other in [('claim','text','另一项主张'),('claim','metric','不同指标'),
             ('claim','proposal','甲'),('claim','evidence_ids',[]),('finding','impact','待遇'),('finding','verdict','refuted'),
             ('finding','categories',['preference']),('finding','reason','有不同理由'),('finding','evidence_ids',[]),
@@ -74,7 +79,7 @@ class ComparisonTests(SimpleTestCase):
                 self.assertEqual(sorted(len(g) for g in finding_groups(changed)), [1, 2])
                 self.assertEqual(len([k for k in matching_steps(changed, steps) if k.startswith('review_')]), 2)
 
-    def run_with_options(self, options=None):
+    def run_with_options(self, options=None, **summary_fields):
         team = connections()
         state = make_state(team, [])
         state.update(phase='confirmed', brief={'goal': '选择方案', 'unknowns': '', 'assumptions': ''})
@@ -86,8 +91,10 @@ class ComparisonTests(SimpleTestCase):
 
         def generate(messages, **kwargs):
             value = fixture(stage)
-            if stage == 'synthesizer' and options is not None:
-                value['options'] = options
+            if stage == 'synthesizer':
+                value.update(summary_fields)
+                if options is not None:
+                    value['options'] = options
             return json.dumps(value, ensure_ascii=False)
 
         with patch('delivery.decision_team_engine.generate_reply', side_effect=generate):
@@ -111,6 +118,15 @@ class ComparisonTests(SimpleTestCase):
         self.assertEqual(state['summary']['options'], [])
         self.assertNotIn('## 方案比较', result)
 
+    def test_short_answer_keeps_unique_conditions_and_skips_an_empty_next_step(self):
+        advice = '先与供应商确认总价。'
+        state, result = self.run_with_options(recommendation=advice, conditions=['报价仍有效', '报价仍有效'],
+                                              next_steps=[], unknowns=['是否含税', '是否含税'])
+        self.assertTrue(result.startswith('## 当前建议与条件\n' + advice + '\n\n'))
+        self.assertEqual(result.count('报价仍有效'), 1)
+        self.assertEqual(state['summary']['unknowns'], ['是否含税'])
+        self.assertNotIn('## 下一步', result)
+
     def test_report_prioritizes_action_and_combines_only_matching_opinions(self):
         state, _ = self.run_with_options()
         state['final_opinions'][-1]['reason'] = '需要先拿到报价'
@@ -120,7 +136,7 @@ class ComparisonTests(SimpleTestCase):
         self.assertIn('DeepSeek、Kimi：', result)
         self.assertIn('需要先拿到报价', result)
         links = report_references(state)
-        ref = next(link for link in links if link['section'] == '重要分歧与核验')
+        ref = next(link for link in links if link['section'] == '成员核验记录')
         self.assertIn(ref['line'] + '（依据 ' + '、'.join(ref['ids']) + '）', result)
         self.assertTrue(ref['legacy_match'])
         checked = next(f for f in state['reviews'] if f['evidence_ids'])

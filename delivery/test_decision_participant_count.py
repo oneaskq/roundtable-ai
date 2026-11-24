@@ -85,4 +85,5 @@ class ParticipantCountTests(TestCase):
         self.assertEqual(len(state['reviews']), 2)
         self.assertEqual(len(state['responses']), 2)
         self.assertNotIn('analysis_p3', stages)
-        self.assertIn('重要分歧', result)
+        self.assertIn('## 成员核验记录', result)
+        self.assertEqual(result.count('回应：待确定。需要核实'), 2)

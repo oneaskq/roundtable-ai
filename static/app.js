@@ -312,6 +312,7 @@ function restoreDraft() {
 }
 function showAuth() {
   resetSources();
+  clearTimeout(hourlyBudgetTimer);
   closeAiConsent(); state.messageSignature = ""; state.messageEdit = null; state.scrollConversation = null;
   closeAcceptanceEditor(); state.acceptanceStatus = null;
   stopReplyWaiting("navigation");
@@ -414,8 +415,15 @@ function selectedMembers() {
   const ids = state.participantSelection ?? team?.default_member_ids ?? [];
   return (team?.members || []).filter(member => member.ready && ids.includes(member.id));
 }
-function chatAvailable() {
+function selectedTeamReady() {
   return Boolean(state.capabilities?.team?.revision) && selectedMembers().length >= 2;
+}
+function activeHourlyBudget() {
+  const budget = state.capabilities?.hourly_budget;
+  return budget && Date.parse(budget.resets_at) > Date.now() ? budget : null;
+}
+function chatAvailable() {
+  return selectedTeamReady() && activeHourlyBudget()?.remaining !== 0;
 }
 function renderParticipantOptions(locked) {
   const group = $("#participant-options");
@@ -494,9 +502,17 @@ function restoreConversationMode() {
 }
 function providerName(provider) { return ({ deepseek: "DeepSeek", kimi: "Kimi", qwen: "千问", gateway: "AI Gateway" })[provider] || provider || "未配置服务"; }
 function modelName() { return selectedMembers().map(member => `${providerName(member.provider)} · ${member.model}`).join("、") || "尚未选择成员"; }
+let hourlyBudgetTimer;
 function applyCapabilities(data) {
   const previous = modelIdentity(); state.capabilities = data; state.capabilityError = "";
   if (previous !== modelIdentity()) { state.aiConsentFor = null; }
+  clearTimeout(hourlyBudgetTimer);
+  const budget = activeHourlyBudget();
+  if (budget) {
+    hourlyBudgetTimer = setTimeout(() => {
+      if (state.user && state.capabilities === data) renderModelControls();
+    }, Date.parse(budget.resets_at) - Date.now() + 1);
+  }
   renderModelControls();
 }
 async function refreshCapabilities() {
@@ -520,12 +536,11 @@ function renderModelControls() {
   $("#message-input").maxLength = clarifying ? 2000 : 12000;
   $("#connection-summary").textContent = state.capabilityError || team?.notice || (team ? "团队仍需完成模型连接与验收。" : "正在读取团队状态。");
   $("#availability-text").textContent = clarifying ? "回复或跳过后，团队将按本轮已确认的额度继续。" : running ? "后台处理本轮任务 · 停止后可继续发送" : state.capabilityError || (available ? (hasTeamConsent() ? `本轮最多 ${deliveryLimit()} 次模型调用` : "首次发送时确认参与成员和调用额度") : team?.configured ? "模型待验收 · 可先保存需求" : team ? "AI 未配置 · 可先保存需求" : "读取团队状态中…");
-  if (!running && !clarifying && team && !available) {
+  if (!running && !clarifying && team && !selectedTeamReady()) {
     $("#availability-text").textContent = "请选择至少两位已就绪的成员，当前可先保存问题。";
     $("#message-input").placeholder = "写下想讨论的问题，可先保存";
   }
-  const sendForDiscussion = available;
-  const actionLabel = clarifying ? "发送回答并继续" : running ? "协作中" : task?.status === "paused" ? "保存补充" : sendForDiscussion ? "发送并开始团队协作" : "保存需求";
+  const actionLabel = clarifying ? "发送回答并继续" : running ? "协作中" : task?.status === "paused" ? "保存补充" : available ? "发送并开始团队协作" : "保存问题";
   $("#send-message").setAttribute("aria-label", actionLabel); $("#send-message").title = actionLabel;
   $("#composer-hint").textContent = `Enter ${actionLabel} · Shift + Enter 换行`;
   if ($("#send-label")) $("#send-label").textContent = state.activeSave ? "保存中…" : actionLabel;
@@ -538,11 +553,12 @@ function renderModelControls() {
     edit.title = editReason || "编辑消息";
   });
   renderInterjectionControls();
-  const budget = state.capabilities?.hourly_budget;
-  const reset = budget?.resets_at ? new Date(budget.resets_at) : null;
-  if (!running && !clarifying && available && reset > new Date() && budget.remaining < deliveryLimit()) {
-    const when = reset.toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"});
-    $("#availability-text").textContent = `本小时还可调用 ${budget.remaining} 次，${when} 恢复。${budget.remaining ? "较长的讨论可能提前结束。" : "现在仍可保存问题。"}`;
+  const budget = activeHourlyBudget();
+  if (!running && !clarifying && selectedTeamReady() && budget && budget.remaining < deliveryLimit()) {
+    const when = new Date(budget.resets_at).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"});
+    $("#availability-text").textContent = budget.remaining
+      ? `本小时还可调用 ${budget.remaining} 次，${when} 恢复。较长的讨论可能提前结束。`
+      : `本小时调用次数已用完，${when} 恢复。现在发送会先保存问题。`;
   }
   renderAcceptanceControls(running);
   sourcesUI?.setContext({conversationId: state.view === "roundtable" ? state.conversation?.id || null : null,
@@ -679,12 +695,15 @@ function renderReplyFeedback() {
   else if (task?.runs?.[0]?.status === "needs_review" && !text) text = "核验发现待修订项，可查看协作记录并补充要求。";
   else if (task?.status === "failed" && !text) text = task.runs?.[0]?.error || "本轮未完成。需求已保存，可查看记录后重新协作。";
   else if (task?.status === "waiting" && !text) {
-    text = !chatAvailable() ? (state.capabilityError || (state.deliveryMode === "text" && state.capabilities?.team?.decision_hint ? "问题已保存。" + state.capabilities.team.decision_hint : state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看成员状态。" : "需求已保存，正在读取团队状态。"))
-      : "需求已保存，可以开始团队协作。";
+    if (!selectedTeamReady()) {
+      text = state.capabilityError || (state.deliveryMode === "text" && state.capabilities?.team?.decision_hint ? "问题已保存。" + state.capabilities.team.decision_hint : state.capabilities ? "需求已保存，团队尚未就绪。请在对话设置中查看成员状态。" : "需求已保存，正在读取团队状态。");
+    } else {
+      text = chatAvailable() ? "需求已保存，可以开始团队协作。" : "问题已保存。额度恢复后，点下方按钮开始讨论。";
+    }
   }
   $("#reply-feedback").hidden = !text && !needsBrief; $("#reply-feedback-text").hidden = !text; $("#reply-feedback-text").textContent = text;
   $("#reply-feedback").classList.toggle("has-error", !pending && (feedback?.error || task?.status === "failed"));
-  $("#request-reply").hidden = waiting || Boolean(unresolved) || !task || !["waiting", "failed"].includes(task.status) || pending || !chatAvailable();
+  $("#request-reply").hidden = waiting || Boolean(unresolved) || !task || !["waiting", "failed"].includes(task.status) || pending || !selectedTeamReady();
   $("#skip-clarification").hidden = !needsBrief;
   $("#skip-clarification").disabled = Boolean(state.activeSave) || Boolean(state.activeReply);
   $("#request-reply").textContent = feedback?.briefStale ? "重新整理问题" : task?.status === "failed" || feedback?.error ? "重新协作" : "开始团队协作";
@@ -911,6 +930,10 @@ async function requestReply(reusePending = false) {
     }
     catch { if (replyContextCurrent(request)) state.replyFeedback[request.conversationId] = { text: taskChanged ? "任务已更新，本次协作未启动，暂未读取到最新需求。请先刷新对话状态，再核对需求与验收用例并重新确认 AI 团队。" : "暂时无法确认协作状态。你的原文已保存；模型服务可能仍在处理，请先刷新对话状态。", error: true }; }
     if (["capability_pending", "team_pending", "connection_changed", "team_changed", "hourly_budget_exhausted"].includes(error.code)) await refreshCapabilities().catch(() => {});
+    if (error.code === "hourly_budget_exhausted" && !reusePending && replyContextCurrent(request) &&
+        currentTask()?.id === request.taskId && currentTask()?.status === "waiting" && state.capabilities?.hourly_budget) {
+      delete state.replyFeedback[request.conversationId];
+    }
     if (pendingSubmission(request.conversationId) && replyContextCurrent(request)) {
       try { await checkPendingSubmission(request.conversationId); } catch { /* Keep the receipt marker for a later check. */ }
     }
@@ -1050,12 +1073,14 @@ function renderChat(preserveArtifacts = false) {
     const history = archived.length ? el("details", {class: "message-history"}, [el("summary", {text: `查看编辑前的对话（${archived.length} 条）`}),
       ...archived.map(message => el("div", {class: "message-history-entry"}, [el("strong", {text: message.role === "user" ? "你" : "圆桌"}), el("p", {text: message.content || ""})]))]) : null;
     const activeMessages = state.messages.filter(message => !message.superseded_by);
+    const openReports = new Set(Array.from($("#messages").querySelectorAll("article[data-report-id] .report-details[open]"),
+      detail => detail.closest("article[data-report-id]").dataset.reportId));
     const messages = activeMessages.map((message) => {
       const resultRun = runsForChat.find(run => run.workflow === 'decision_v1' && run.decision?.result_message_id === message.id);
       if (['quick_group', 'direct_member'].includes(resultRun?.decision?.response_kind)) return null;
       const report = message.role === "assistant" && resultRun && resultRun.decision?.response_kind !== "quick" ? resultRun : null;
       const content = el("div", {class: report ? "message-content report-content" : "message-content"});
-      if (message.role === "assistant" && window.RoundtableMessage) content.append(window.RoundtableMessage.render(message.content || "", report?.decision));
+      if (message.role === "assistant" && window.RoundtableMessage) content.append(window.RoundtableMessage.render(message.content || "", report?.decision, openReports.has(report?.id)));
       else content.textContent = message.content || "";
       const copy = el("button", {type: "button", class: "message-copy message-action", title: "复制", "aria-label": message.role === "user" ? "复制消息" : "复制回复"}, [messageIcon("copy")]);
       copy.addEventListener("click", async () => {

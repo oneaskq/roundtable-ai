@@ -24,6 +24,7 @@ from .team_engine import MAX_PACKET_CHARS, _json, _public_context, _public_outpu
 
 
 VERSION = 'decision-v1'
+LEGACY_REVIEW_TITLE = '重要分歧与核验'
 MAX_DISCUSSION_SECONDS = 600
 BRIEF_FIELDS = ('goal', 'metrics', 'constraints', 'preferences', 'assumptions', 'unknowns', 'answers')
 CATEGORIES = {'fact', 'reasoning', 'preference', 'information'}
@@ -799,8 +800,11 @@ reason 直接回答对方刚才的具体理由，一两句说清你因此会改�
     state['phase'] = 'synthesis'
     persist(state)
     new_messages = discussion_step('synthesizer')
-    summary_prompt = '''结合问题说明与记录给用户结果；先按用户实际回答更新草稿中的偏好、假设和未知项。
-recommendation 用两三句收束这次对话，直接给用户可用的建议；最影响选择的分歧和条件说清即可。
+    summary_prompt = '''用用户最后澄清的意思回答原问题。更新早先的假设，不把缺乏依据的猜测当成用户的打算。
+recommendation 会单独显示在聊天里。日常选择通常用一两句话。第一句直接给建议，第二句只说最能改变选择的条件或一个具体的下一步。
+像当面对用户说话，省去复述题目、介绍讨论过程和逐一转述成员意见的铺垫。观念问题直接给判断和理由。
+复杂问题在这段建议里交代会改变结论的重要分歧、限制或不确定性。详细推导和用户要求的比较放在展开后的报告里。
+conditions、next_steps、unknowns 各写确有补充的内容，没有就留空。同一提醒只说一次。大家认同的提醒或共同缺少的事实不算意见对立。
 unknowns 只列仍待确认的问题，部分回答时保留尚未解决的部分。未核实或偏好未定时提供条件建议，
 不得把模型投票当事实，不得遗漏重要少数意见。analyses 是各成员独立分析时的原始意见；
 final_opinions 仅包含实际回应质疑的成员，不能把未回应者的初始意见当成其最终立场或认同。
@@ -826,7 +830,8 @@ status 和 evidence_ids 必须与该主张的核验记录相符，系统将展�
         state['unresolved'].append(f'讨论结束时，还有 {len(pending_user_messages)} 条用户插话未收到直接答复。')
     state['summary'] = {'recommendation': _text(value.get('recommendation', ''), '最终建议', 3000, required=True)}
     for key in ('conditions', 'next_steps', 'unknowns'):
-        state['summary'][key] = [_text(x, key, 1000, required=True) for x in _items(value.get(key, []), key, 12)]
+        entries = (_text(x, key, 1000, required=True) for x in _items(value.get(key, []), key, 12))
+        state['summary'][key] = list(dict.fromkeys(entries))
     state['summary']['options'] = []
     for item in _items(value.get('options', []), '方案比较', 8):
         if not isinstance(item, dict):
@@ -883,6 +888,8 @@ status 和 evidence_ids 必须与该主张的核验记录相符，系统将展�
         state['unresolved'].append('独立分析基于插话前的条件；如果补充改变了目标或硬约束，需要重新开展独立分析。')
         state['user_updates_during_discussion'] = True
     state['unresolved'] = list(dict.fromkeys(state['unresolved']))
+    # Evidence links use the heading that was actually saved with this report.
+    state['review_section_title'] = '成员核验记录'
     state['phase'] = 'completed'
     # Keep traceable excerpts, not a second full copy of the selected files.
     state.pop('sources', None)
@@ -950,7 +957,7 @@ def report_references(state):
     for line, candidates in finding_sources.items():
         for ids in sorted(candidates):
             if ids:
-                refs.append({'section': '重要分歧与核验', 'line': line, 'ids': list(ids),
+                refs.append({'section': state.get('review_section_title', LEGACY_REVIEW_TITLE), 'line': line, 'ids': list(ids),
                              'legacy_match': len(candidates) == 1})
     return refs
 
@@ -960,7 +967,8 @@ def render_result(state):
     lines = ['## 当前建议与条件', summary['recommendation']]
     if summary['conditions']:
         lines += ['\n成立条件：'] + ['- ' + x for x in summary['conditions']]
-    lines += ['\n## 下一步'] + (['- ' + x for x in dict.fromkeys(summary['next_steps'])] or ['- 补充或核实影响建议的条件。'])
+    if summary['next_steps']:
+        lines += ['\n## 下一步'] + ['- ' + x for x in dict.fromkeys(summary['next_steps'])]
     basis_lines = ['- ' + _basis_line(item) + _citation_suffix(item['evidence_ids']) for item in summary['basis']]
     lines += ['\n## 主要依据', research_note(state.get('public_research'))] + (
         list(dict.fromkeys(basis_lines)) or ['- 暂无可确认的依据摘要。'])
@@ -977,7 +985,7 @@ def render_result(state):
             if option['conditions']:
                 line += f'；适用条件或未知项：{option["conditions"]}'
             lines.append(line)
-    lines += ['\n## 重要分歧与核验']
+    lines += ['\n## ' + state.get('review_section_title', LEGACY_REVIEW_TITLE)]
     important = [group for group in finding_groups(state) if group[0][0]['important']
                  or group[0][0]['verdict'] in ('refuted', 'unverified', 'user_decision')]
     if important:

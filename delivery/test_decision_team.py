@@ -162,6 +162,7 @@ class DecisionEngineTests(TestCase):
         self.assertNotIn('旧团队的答案', json.dumps(packets, ensure_ascii=False))
         self.assertNotIn('旧团队的答案', json.dumps(self.packets['clarifier'], ensure_ascii=False))
         self.assertIn('补充：费用包含税费', json.dumps(self.packets['review_p1'], ensure_ascii=False))
+        self.assertEqual(self.packets['synthesizer']['conversation'][-1], {'role': 'user', 'content': '补充：费用包含税费'})
         self.assertEqual(self.state['phase'], 'completed')
         self.assertIn('待核实主张', result)
         self.assertIn('意见分布', result)

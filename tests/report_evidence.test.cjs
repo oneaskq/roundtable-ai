@@ -27,6 +27,33 @@ const state = {
   ],
 };
 
+test('a saved decision shows its exact recommendation first and keeps conditions and citations in the disclosure', () => {
+  const advice = '先向供应商确认报价。\n总价在预算内，再决定是否采购。';
+  const report = '## 当前建议与条件\n' + advice + '\n\n成立条件：\n- 报价适用期\n\n## 主要依据\n- 六个月的报价（依据 E1、E2）';
+  const decision = {...state, summary:{recommendation:advice}};
+  const textOf = element => element.textContent + element.children.map(textOf).join('');
+  const rendered = render(report.replace(/\n/g, '\r\n'), decision);
+  const disclosure = rendered.find('details').find(item => item.className === 'report-details');
+  assert.ok(disclosure);
+  assert.equal(disclosure.open, false);
+  const preview = rendered.children.filter(item => item !== disclosure).map(textOf).join('');
+  assert.equal(preview, advice.replace('\n', ''));
+  assert.ok(!preview.includes('报价适用期'));
+  assert.ok(textOf(disclosure).includes('报价适用期'));
+  assert.ok(!textOf(disclosure).includes('先向供应商'));
+  assert.deepEqual(disclosure.find('summary').map(item => item.textContent), ['查看完整报告', '报价单', '计算过程']);
+  assert.equal(render(report, decision, true).find('details')[0].open, true);
+});
+
+test('ordinary replies, short answers and reports without a matching saved recommendation stay readable in full', () => {
+  const full = '## 当前建议与条件\n先核对总价。\n\n## 下一步\n- 找到报价单。';
+  for (const [text, decision] of [[full, null], [full, state], [full, {summary:{recommendation:'另一条建议。'}}],
+    [full.split('\n\n')[0], {summary:{recommendation:'先核对总价。'}}]]) {
+    assert.equal(render(text, decision).find('details').length, 0);
+    assert.equal(render(text, decision).find('h2').length, text.includes('下一步') ? 2 : 1);
+  }
+});
+
 test('a cited claim exposes the original excerpt and the actual calculation in place', () => {
   const tree = render('## 主要依据\n- 六个月的报价（依据 E1、E2）', state);
   assert.deepEqual(tree.find('summary').map(el => el.textContent), ['报价单', '计算过程']);
@@ -48,7 +75,12 @@ test('a retrieved web citation exposes its checked excerpt, retrieval date and o
 
 test('only an unambiguous saved finding matches a legacy line without IDs', () => {
   const old = '## 重要分歧与核验\n- 计算有误\n  回应：接受纠错';
-  assert.equal(render(old, state).find('details').length, 1);
+  const archived = render(old, state);
+  assert.equal(archived.find('h2')[0].find('text')[0].textContent, '成员核验记录');
+  assert.equal(archived.find('details').length, 1);
+  assert.equal(render(old).find('h2')[0].find('text')[0].textContent, '重要分歧与核验');
+  const current = {...state, report_references: [{...state.report_references[1], section:'成员核验记录'}]};
+  assert.equal(render(old.replace('重要分歧与核验', '成员核验记录'), current).find('details').length, 1);
   const conflicting = {...state, report_references: [{...state.report_references[1], legacy_match: false}]};
   assert.equal(render(old, conflicting).find('details').length, 0);
   assert.equal(render(old.replace('计算有误', '另一项计算'), state).find('details').length, 0);
