@@ -111,11 +111,11 @@ class DiscussionPresentationTests(TestCase):
 
     def test_long_legacy_text_is_kept_whole_and_fenced_json_uses_the_worker_parser(self):
         reason = '原文中的条件和假设都需要保留。' * 18 + '所以目前不能下结论。'
-        step = self.step('review_p1', {'findings': [{'reason': reason}]}, 1)
+        step = self.step('review_p1', {'findings': [{'reason': '次要条件。'}, {'reason': reason, 'important': True}]}, 1)
         step.output = '```json\n' + step.output + '\n```'
         step.save(update_fields=['output'])
         data = serialize_run(self.run)
-        self.assertEqual(data['discussion'][0]['turn']['text'], '')
+        self.assertEqual(data['discussion'][0]['turn']['text'], reason)
         self.assertIn(reason, data['discussion'][0]['content'])
         self.assertEqual(data['steps'][0]['output'], step.output)
 

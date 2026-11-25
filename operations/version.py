@@ -1,1 +1,1 @@
-APP_VERSION = '0.23.1-internal'
+APP_VERSION = '0.25.0-internal'

@@ -21,15 +21,53 @@ class ReportFollowupTests(TestCase):
         self.client.force_login(self.owner)
         self.chat = Conversation.objects.create(owner=self.owner)
 
-    def report(self, body, *, chat=None, kind='discussion', sources=None):
+    def report(self, body, *, chat=None, kind='discussion', sources=None, advice=None):
         chat = chat or self.chat
         task = Task.objects.create(conversation=chat, owner=chat.owner, goal='比较', status='completed')
         msg = Message.objects.create(conversation=chat, role='assistant', content=body)
         TeamRun.objects.create(task=task, execution_id=uuid.uuid4(), team_revision='a' * 64,
             workflow='decision_v1', status='completed', source_snapshot=sources or [], decision_state={'response_kind': kind,
-                'result_message_id': str(msg.pk), 'evidence': [{'id': 'E1', 'type': 'calculation',
+                'result_message_id': str(msg.pk), 'summary': {'recommendation': advice or body}, 'evidence': [{'id': 'E1', 'type': 'calculation',
                     'status': 'executed', 'expression': '100*6', 'result': '600'}]})
         return msg
+
+    def test_receipt_after_report_is_saved_once_without_a_new_task_or_model_call(self):
+        self.report('先向供应商核实报价。')
+        url = f'/api/conversations/{self.chat.id}'
+        data = {'content': '可以的。', 'client_message_id': str(uuid.uuid4())}
+        for expected in (201, 200):
+            response = self.client.post(url, data, content_type='application/json')
+            self.assertEqual(response.status_code, expected)
+            self.assertEqual(response.json()['task']['status'], 'completed')
+        self.assertEqual(self.chat.messages.filter(role='user').count(), 1)
+        self.assertEqual(self.chat.tasks.count(), 1)
+        self.assertFalse(TeamRun.objects.exclude(status='completed').exists())
+        next_post = self.client.post(url, {'content':'好的，帮我写一封询价邮件。'}, content_type='application/json')
+        self.assertEqual(next_post.json()['task']['status'], 'waiting')
+
+    def test_new_material_keeps_a_short_followup_actionable(self):
+        self.report('先核对报价。')
+        run = TeamRun.objects.get()
+        run.source_revision = sources_revision([])
+        run.save(update_fields=['source_revision'])
+        SourceMaterial.objects.create(conversation=self.chat, owner=self.owner, kind='file', name='补充报价',
+                                      content='报价已含税', byte_size=15, sha256='a' * 64)
+        response = self.client.post(f'/api/conversations/{self.chat.id}', {'content':'可以的'}, content_type='application/json')
+        self.assertEqual(response.json()['task']['status'], 'waiting')
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_yes_to_an_offer_keeps_the_preceding_question_for_the_clarifier(self, generate):
+        advice = '需要我帮你起草询价邮件吗？'
+        body = '## 当前建议与条件\n' + advice + '\n\n## 下一步\n核对总价。'
+        self.report(body, advice=advice)
+        result = self.client.post(f'/api/conversations/{self.chat.id}', {'content':'可以的'}, content_type='application/json')
+        self.assertEqual(result.json()['task']['status'], 'waiting')
+        team = connections()
+        generate.return_value = json.dumps({'mode':'quick', 'quick_reply':'询价邮件草稿'}, ensure_ascii=False)
+        context = [{'role':'assistant','content':body},{'role':'user','content':'可以的'}]
+        prepare_brief(context, team, make_state(team, []), lambda *_: None, lambda *_: None)
+        packet = json.loads(generate.call_args.args[0][0]['content'])
+        self.assertEqual(packet['preceding_question_or_offer'], advice)
 
     def test_reference_respects_branch_conversation_and_explicit_older_quote(self):
         other = Conversation.objects.create(owner=self.owner)

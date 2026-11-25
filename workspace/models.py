@@ -118,6 +118,13 @@ class SourceMaterial(OwnedRecord):
 
 class Memory(OwnedRecord):
     content = models.TextField(max_length=6000)
+    auto_key = models.CharField(max_length=80, blank=True, default='')
+    source_conversation = models.ForeignKey(Conversation, null=True, blank=True, on_delete=models.SET_NULL)
+    source_turn = models.UUIDField(null=True, blank=True)
+
+    class Meta(OwnedRecord.Meta):
+        constraints = [models.UniqueConstraint(fields=['owner', 'auto_key'], condition=~Q(auto_key=''),
+                                               name='unique_learned_memory_per_owner')]
 
 
 class Task(OwnedRecord):
@@ -192,6 +199,7 @@ class DataPolicy(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="data_policy")
     retention_days = models.PositiveIntegerField(choices=RETENTION_CHOICES, default=0)
     auto_cleanup = models.BooleanField(default=False)
+    cross_chat_memory = models.BooleanField(default=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

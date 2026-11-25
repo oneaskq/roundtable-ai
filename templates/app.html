@@ -8,7 +8,7 @@
   <meta name="theme-color" content="#ffffff">
   <meta name="referrer" content="no-referrer">
   <title>圆桌 · 把目标交给团队</title>
-  <link rel="stylesheet" href="{% static 'app.css' %}?v=dialogue-turns-1">
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=chat-outline-1">
   <link rel="icon" type="image/svg+xml" href="{% static 'favicon.svg' %}">
   <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=compact-report-2">
   <script src="{% static 'report-followup.js' %}?v=1" defer></script>
@@ -16,9 +16,10 @@
   <script src="{% static 'sources.js' %}?v=0.20-first-message" defer></script>
   <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=auto-lookup-1">
   <script src="{% static 'discussion-timing.js' %}?v=2" defer></script>
-  <script src="{% static 'discussion-presentation.js' %}?v=dialogue-turns-1" defer></script>
+  <script src="{% static 'discussion-presentation.js' %}?v=chat-ui-1" defer></script>
   <script src="{% static 'delivery-intent.js' %}?v=1" defer></script>
-  <script src="{% static 'app.js' %}?v=compact-report-2" defer></script>
+  <script src="{% static 'conversation-outline.js' %}?v=1" defer></script>
+  <script src="{% static 'app.js' %}?v=chat-outline-1" defer></script>
 </head>
 <body>
   <div class="csrf-holder" hidden>{% csrf_token %}</div>
@@ -65,27 +66,33 @@
     <a class="skip-link" href="#main-content">跳到主要内容</a>
     <button id="sidebar-shade" class="sidebar-shade" aria-label="关闭导航" hidden></button>
     <aside id="sidebar" class="sidebar">
-      <a class="brand" href="/"><span class="roundtable-logo" aria-hidden="true"></span><span>圆桌</span></a>
-      <button id="new-conversation" class="new-conversation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5H5v14h14v-7M10 14l1-4 8-8 3 3-8 8-4 1Z"/></svg> 新对话</button>
-      <nav aria-label="主导航">
-        <button class="nav-item active" data-view="roundtable"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z"/></svg> 对话</button>
-        <button class="nav-item" data-view="projects"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg> 我的项目</button>
-        <button class="nav-item" data-view="memories"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v17l-6-4-6 4Z"/></svg> 个人记忆</button>
+      <div class="sidebar-header">
+        <button type="button" class="brand nav-item" data-view="roundtable" aria-label="返回圆桌对话" title="返回圆桌对话"><span class="roundtable-logo" aria-hidden="true"></span></button>
+        <button type="button" id="sidebar-toggle" class="icon-button" aria-controls="sidebar" aria-label="收起侧边栏" aria-expanded="true" title="收起侧边栏"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button>
+      </div>
+      <nav class="sidebar-actions" aria-label="主导航">
+        <button type="button" id="new-conversation" class="new-conversation" aria-label="新对话" title="新对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5H5v14h14v-7M10 14l1-4 8-8 3 3-8 8-4 1Z"/></svg><span class="nav-label">新对话</span></button>
+        <button type="button" id="search-open" class="sidebar-action" aria-label="搜索对话" aria-haspopup="dialog" aria-controls="chat-search-dialog" title="搜索对话"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><span class="nav-label">搜索对话</span></button>
+        <button type="button" class="nav-item" data-view="projects" aria-label="项目" title="项目"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg><span class="nav-label">项目</span></button>
       </nav>
-      <label class="conversation-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><span class="sr-only">搜索对话</span><input id="conversation-search" type="search" placeholder="搜索对话" autocomplete="off" aria-controls="conversation-list"></label>
       <div class="history-heading">最近对话</div>
-      <div id="conversation-list" class="conversation-list"><p class="sidebar-empty">暂无对话</p></div>
-      <div class="sidebar-bottom"><details class="account-settings"><summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6 7 7m10 10 1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4"/></svg>设置</summary><nav aria-label="个人设置"><button class="nav-item" data-view="data">数据中心</button><button class="nav-item" data-view="security">账号安全</button></nav></details><div class="user-row"><div id="user-avatar" class="avatar">你</div><div class="user-info"><strong id="user-name">我的账号</strong><small id="user-email"></small></div><button id="logout" class="icon-button" title="退出登录" aria-label="退出登录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v16h5M10 12h11m-4-4 4 4-4 4"/></svg></button></div></div>
+      <div id="conversation-list" class="conversation-list"></div>
+      <div class="sidebar-bottom">
+        <details class="account-settings">
+          <summary class="user-row" title="账号设置" aria-label="账号设置"><span id="user-avatar" class="avatar">你</span><span class="user-info"><strong id="user-name">我的账号</strong></span></summary>
+          <nav aria-label="账号设置"><small id="user-email"></small><button class="nav-item" data-view="memories">个人记忆</button><button class="nav-item" data-view="data">数据中心</button><button class="nav-item" data-view="security">账号安全</button><button id="logout" type="button" class="text-button">退出登录</button></nav>
+        </details>
+      </div>
     </aside>
     <main id="main-content" class="main-pane" tabindex="-1">
-      <header class="topbar"><div class="breadcrumb"><button id="menu-toggle" class="icon-button" aria-label="收起导航" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button><span id="view-title">工作空间</span><span class="breadcrumb-slash">/</span><strong id="view-subtitle">圆桌</strong></div></header>
+      <header class="topbar"><div class="breadcrumb"><button id="menu-toggle" class="icon-button" aria-label="收起导航" aria-controls="sidebar" aria-expanded="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button><span id="view-title" class="sr-only">工作空间</span><strong id="view-subtitle">圆桌</strong></div>
+        <div id="conversation-heading" class="conversation-heading" hidden><h1 id="conversation-title">新对话</h1><span id="task-status" class="status-chip">等待模型接入</span><details id="conversation-menu" class="conversation-menu"><summary aria-label="会话操作" title="会话操作">⋯</summary><div class="conversation-menu-panel"><details id="team-record"><summary>查看协作记录</summary><div id="team-runs"></div><details id="work-log" class="work-log" hidden><summary>工作记录</summary><div id="work-log-list"></div></details></details><button id="artifacts-toggle" class="text-button" aria-expanded="false" aria-controls="artifacts-panel">历史文件</button><div id="artifacts-panel" class="artifacts-panel" hidden><button id="brief-task" class="text-button" type="button">生成需求文件</button><div id="artifacts-list"></div></div><button type="button" id="delete-conversation" class="text-button">删除对话</button></div></details></div>
+      </header>
       <section id="roundtable-view" class="view chat-view">
         <div id="chat-scroll" class="chat-scroll" tabindex="0" aria-label="对话内容"><div id="chat-content" class="chat-content">
         <div id="chat-empty" class="chat-empty">
-          <div class="hero-mark"><span class="roundtable-logo" aria-hidden="true"></span></div>
-          <h1>今天想讨论什么？</h1>
+          <h1>今天想聊什么？</h1>
         </div>
-        <div id="conversation-heading" class="conversation-heading" hidden><h1 id="conversation-title">新对话</h1><span id="task-status" class="status-chip">等待模型接入</span><details id="conversation-menu" class="conversation-menu"><summary aria-label="会话操作" title="会话操作">⋯</summary><div class="conversation-menu-panel"><details id="team-record"><summary>查看协作记录</summary><div id="team-runs"></div><details id="work-log" class="work-log" hidden><summary>工作记录</summary><div id="work-log-list"></div></details></details><button id="artifacts-toggle" class="text-button" aria-expanded="false" aria-controls="artifacts-panel">历史文件</button><div id="artifacts-panel" class="artifacts-panel" hidden><button id="brief-task" class="text-button" type="button">生成需求文件</button><div id="artifacts-list"></div></div><button type="button" id="delete-conversation" class="text-button">删除对话</button></div></details></div>
         <div id="messages" class="messages" aria-live="polite"></div>
         <article id="live-draft" class="message assistant live-draft" hidden><p id="live-draft-label" class="live-draft-label"></p><div id="live-draft-content" class="message-content" aria-live="off"></div></article>
         <div id="reply-feedback" class="reply-feedback" role="status" aria-live="polite" hidden><p id="reply-feedback-text"></p><div class="reply-actions"><button type="button" id="request-reply" class="button">开始协作</button><button type="button" id="skip-clarification" class="text-button" hidden>暂不回答，继续讨论</button><button type="button" id="retry-pending-submission" class="button" hidden>继续同一次提交</button><button type="button" id="stop-waiting" class="text-button" hidden>停止等待</button><button type="button" id="refresh-conversation" class="text-button">刷新状态</button></div></div>
@@ -99,6 +106,9 @@
         <div id="task-controls" class="task-controls" hidden><button id="pause-task" class="text-button">暂停任务</button></div>
         
         </div></div>
+        <nav id="conversation-outline" class="conversation-outline" aria-label="按发言跳转" hidden>
+          <div class="outline-marks"></div><span class="outline-preview" aria-hidden="true" dir="auto" hidden></span>
+        </nav>
         <div class="composer-wrap">
           <button id="scroll-to-bottom" class="scroll-to-bottom icon-button" type="button" aria-label="查看最新消息" title="查看最新消息" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-6-6 6 6 6-6"/></svg></button>
           <section id="ai-consent" class="ai-consent" aria-label="确认使用 AI 团队" hidden><p id="ai-consent-text"></p><div class="consent-actions"><button id="ai-consent-cancel" class="text-button" type="button">取消</button><button id="ai-consent-save" class="text-button" type="submit" form="composer" hidden>仅保存</button><button id="ai-consent-confirm" class="button primary" type="button">确认并开始讨论</button></div></section>
@@ -108,10 +118,10 @@
               <span id="member-reply-label" aria-live="polite"></span>
               <button id="member-reply-clear" type="button" aria-label="取消点名，发给全体成员">×</button>
             </div>
-            <label class="sr-only" for="message-input">向圆桌交代目标</label><textarea id="message-input" rows="2" maxlength="12000" placeholder="向圆桌提问，或交代一个目标" aria-describedby="composer-hint composer-count" required></textarea>
+            <label class="sr-only" for="message-input">给圆桌发消息</label><textarea id="message-input" rows="1" maxlength="12000" placeholder="给圆桌发消息" aria-describedby="composer-hint composer-count" required></textarea>
             <div class="composer-bottom">
               <button id="sources-open" class="icon-button sources-open" type="button" aria-label="添加材料" aria-haspopup="dialog" aria-controls="sources-dialog" title="添加或查看参考材料" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
-              <details id="composer-options" class="composer-options"><summary aria-label="讨论成员与对话设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span id="composer-options-label">讨论成员</span><span class="options-chevron" aria-hidden="true">⌄</span></summary>
+              <details id="composer-options" class="composer-options"><summary aria-label="讨论成员与对话设置" title="讨论成员与对话设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg><span id="composer-options-label">讨论成员</span><span class="options-chevron" aria-hidden="true">⌄</span></summary>
                 <div class="composer-settings">
                   <fieldset id="participant-count-control" class="participant-picker" aria-describedby="participant-count-note">
                     <legend>参与讨论的成员</legend>
@@ -145,6 +155,10 @@
       <section id="security-view" class="view content-view" hidden></section>
     </main>
   </div>
+  <dialog id="chat-search-dialog" class="chat-search-dialog" aria-label="搜索对话">
+    <div class="search-dialog-heading"><input id="conversation-search" type="search" maxlength="200" placeholder="搜索对话" aria-label="搜索对话标题或消息" autocomplete="off" aria-controls="search-results"><button id="search-close" type="button" class="icon-button" aria-label="关闭搜索">×</button></div>
+    <div id="search-results" class="search-results" aria-live="polite"></div>
+  </dialog>
   <dialog id="form-dialog" aria-labelledby="dialog-title"><form id="dialog-form"><div class="dialog-heading"><h2 id="dialog-title"></h2><button type="button" class="icon-button" id="dialog-close" aria-label="关闭">×</button></div><div id="dialog-fields"></div><p id="dialog-error" class="form-error" role="alert" hidden></p><div class="dialog-actions"><button type="button" id="dialog-cancel" class="button">取消</button><button type="submit" id="dialog-submit" class="button primary">保存</button></div></form></dialog>
   <dialog id="acceptance-dialog" class="acceptance-dialog" aria-labelledby="acceptance-title" aria-describedby="acceptance-description"><form id="acceptance-form"><div class="dialog-heading"><h2 id="acceptance-title">程序验收用例</h2><button type="button" class="icon-button" id="acceptance-close" aria-label="关闭程序验收">×</button></div><p id="acceptance-description" class="acceptance-description">用输入和预期输出验收 Python 程序（main.py）。</p><details class="acceptance-help"><summary>填写规则</summary><p>按原文逐字比较，包含空格和换行。最多 5 个用例，每项输入和预期输出各最多 2,000 字符；空字符串也有效。移除全部用例并保存，即可清除标准。</p></details><p id="acceptance-environment" class="notice" role="status"></p><div id="acceptance-cases" class="acceptance-cases"></div><div class="acceptance-edit-actions"><button type="button" id="acceptance-add" class="button">＋ 添加用例</button><span id="acceptance-count"></span></div><p id="acceptance-error" class="form-error" role="alert" hidden></p><button type="button" id="acceptance-reload" class="text-button" hidden>重新载入已保存的用例（放弃本次修改）</button><div class="dialog-actions"><button type="button" id="acceptance-cancel" class="button">取消</button><button type="submit" id="acceptance-save" class="button primary">保存用例</button></div></form></dialog>
   <dialog id="sources-dialog" class="sources-dialog" aria-labelledby="sources-title" aria-describedby="sources-description">

@@ -145,7 +145,9 @@ def process_waiting_mention():
             if claim is None:
                 return run_id
             try:
-                reply, failure = _reply(item, *claim), ''
+                from workspace.personal_memory import memory_context
+                with memory_context(owner, item.run.task.goal + '\n' + item.content):
+                    reply, failure = _reply(item, *claim), ''
             except ProviderError as error:
                 reply, failure = '', str(error)
             with transaction.atomic():

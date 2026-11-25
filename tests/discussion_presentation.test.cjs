@@ -36,16 +36,18 @@ test('clarification waits only for explicitly addressed outstanding questions', 
   assert.equal(waiting(run, false, s => s).busy, false);
 });
 
-test('member turns keep the referenced viewpoint and every original finding intact', () => {
+test('reviews and responses show the reason and its source once, keeping the original in the record', () => {
   const reason = '这要看导师周五是否值班。' + '只有满足你的课表才能选。'.repeat(7);
   const item = {kind:'assistant', content: '核验记录\n- ' + reason + '\n- 另一条有条件的意见。',
     turn: {text: reason, detail_label:'完整核验（2 条）', reply_to:{kind:'member',label:'Kimi',text:'可以问能不能周五到岗。'}}};
-  const result = turnPresentation(item);
-  assert.equal(result.reference.label, '回应 Kimi');
-  assert.equal(result.reference.text, item.turn.reply_to.text);
-  assert.equal(result.text, reason);
-  assert.equal(result.detail, item.content);
-  assert.equal(result.detailLabel, item.turn.detail_label);
+  for (const role of ['review_p1','response_p2','extra_review','extra_response']) {
+    const result = turnPresentation({...item, role});
+    assert.equal(result.reference.label, '回应 Kimi');
+    assert.equal(result.reference.text, item.turn.reply_to.text);
+    assert.equal(result.text, reason);
+    assert.equal(result.detail, '');
+  }
+  assert.ok(item.content.includes('另一条有条件的意见'));
   assert.equal(turnPresentation({...item,kind:'user'}), null);
   assert.equal(turnPresentation({...item,turn:null}), null);
 });

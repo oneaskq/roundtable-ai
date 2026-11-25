@@ -293,7 +293,9 @@ def respond(request, conversation_id):
         if not Task.objects.filter(id=task.id, status='running', execution_id=execution_id).exists():
             return JsonResponse({'error': '任务已暂停或结束，未发起本次模型请求。'}, status=409)
     try:
-        content = generate_reply(context, connection=connection)
+        from workspace.personal_memory import memory_context
+        with memory_context(request.user.pk, context[-1]['content']):
+            content = generate_reply(context, connection=connection)
     except ProviderError as error:
         with transaction.atomic():
             if Task.objects.filter(id=task.id, status='running', execution_id=execution_id).update(status='failed', execution_id=None, updated_at=timezone.now()):

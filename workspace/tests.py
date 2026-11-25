@@ -47,6 +47,15 @@ class WorkspaceIsolationTests(TestCase):
             self.assertEqual(self.client.get(f"/api/{endpoint}").status_code, 401)
         self.assertEqual(self.post("/api/projects", {"title": "未授权"}).status_code, 401)
 
+    def test_search_matches_owned_titles_and_visible_messages_only(self):
+        visible = Message.objects.create(conversation=self.conversation, role='user', content='核对供应商交期')
+        Message.objects.create(conversation=self.conversation, role='user', content='废弃交期草案', superseded_by=visible)
+        Message.objects.create(conversation=self.other_conversation, role='user', content='核对供应商交期')
+        for term in ('供应商', 'Alice 的任务'):
+            matches = self.client.get('/api/conversations', {'q':term}).json()['conversations']
+            self.assertEqual([item['id'] for item in matches], [str(self.conversation.id)])
+        self.assertEqual(self.client.get('/api/conversations', {'q':'废弃交期'}).json()['conversations'], [])
+
     def test_lists_and_overview_are_owner_scoped(self):
         for endpoint in ["projects", "conversations", "memories", "data/overview"]:
             response = self.client.get(f"/api/{endpoint}")

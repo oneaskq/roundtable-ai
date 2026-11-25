@@ -126,6 +126,8 @@ def _post_team_message(request, conversation_id, payload):
         item = TeamInterjection.objects.create(run=run, client_request_id=request_id,
             content=content.strip(), target_provider=target, reply_to_step_id=reply_to, public_order=order,
             status='mention_queued' if waiting_mention else 'pending')
+        from workspace.personal_memory import learn_turn
+        learn_turn(conversation, item)
         result = {'accepted': True, 'id': str(item.id), 'status': item.status,
                   'continuation_required': continuing}
         if continuing:
@@ -326,15 +328,15 @@ def _discussion_turn(step, value, state, notes):
     if (not isinstance(rows, list) or not rows or any(not isinstance(row, dict)
             or not isinstance(row.get('reason'), str) or not row['reason'].strip() for row in rows)):
         return None
-    # A complete reason retains conditions and negations. Leave exceptionally
-    # long historical reasons in the disclosure instead of cutting a sentence.
+    # Present one complete reason. Prefer a consequential one, then a shorter
+    # one of equal importance. The stage record retains every original row.
     candidates = _member_turn_candidates(step, state, rows, review)
     if not candidates:
         return {'text': '', 'detail_label': f'未关联的核验原文（{len(rows)} 条）'}
-    short = [(row, ref) for row, ref in candidates if len(row['reason'].strip()) <= 220]
     priority = 'important' if review else 'changed'
-    selected, reference = next(((row, ref) for row, ref in short if row.get(priority) is True), (short or candidates)[0])
-    text = selected['reason'].strip() if short else ''
+    relevant = [(row, ref) for row, ref in candidates if row.get(priority) is True] or candidates
+    selected, reference = next(((row, ref) for row, ref in relevant if len(row['reason'].strip()) <= 220), relevant[0])
+    text = selected['reason'].strip()
     turn = {'text': text, 'detail_label': ('完整核验' if review else '完整回应') + f'（{len(rows)} 条）'}
     if not review and isinstance(selected.get('decision'), str):
         turn['decision'] = {'accept': '接受质疑', 'reject': '不接受质疑', 'undetermined': '待确定'}.get(selected['decision'], '')
@@ -391,6 +393,10 @@ def serialize_run(run):
     discussion.sort(key=lambda item: (item['order'] is not None,
         item['order'] if item['order'] is not None else item['created_at']))
     decision = {key: value for key, value in run.decision_state.items() if key not in ('sources', 'followup_report')}
+    if run.workflow == 'decision_v1' and run.status == 'completed' and decision.get('result_message_id'):
+        from .report_followups import report_receipts
+        if receipts := report_receipts(decision):
+            decision['acknowledgements'] = receipts
     if run.workflow == 'decision_v1' and run.status == 'completed' and decision.get('reviews'):
         from .review_groups import matching_steps
         for_matching = matching_steps(decision, run.steps.all())
@@ -869,8 +875,10 @@ def confirm_decision_brief(request, conversation_id):
                     state['followup_report'] = report
             TeamRun.objects.filter(pk=run.pk).update(discussion_counter=F('discussion_counter') + 1)
             order = TeamRun.objects.values_list('discussion_counter', flat=True).get(pk=run.pk)
-            TeamInterjection.objects.create(run=run, client_request_id=uuid.uuid4(), content=answer,
-                                             status='included', public_order=order)
+            item = TeamInterjection.objects.create(run=run, client_request_id=uuid.uuid4(), content=answer,
+                                                  status='included', public_order=order)
+            from workspace.personal_memory import learn_turn
+            learn_turn(conversation, item)
             context.append({'role': 'user', 'content': answer})
         state['brief'] = brief
         if conversational:
@@ -895,8 +903,12 @@ def confirm_decision_brief(request, conversation_id):
 
 
 def execute_team_run(run, *, context=None):
+    from workspace.personal_memory import memory_context
     from .background import execution_heartbeat
-    with execution_heartbeat(run):
+    history = run.input_context if context is None else context
+    latest = next((item['content'] for item in reversed(history) if item.get('role') == 'user'), '')
+    topic = run.task.goal if latest == run.task.goal else run.task.goal + '\n' + latest
+    with execution_heartbeat(run), memory_context(run.task.owner_id, topic):
         return _execute_team_run(run, context=context)
 
 

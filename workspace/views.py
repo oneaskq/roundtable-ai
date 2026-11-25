@@ -7,7 +7,7 @@ from django.contrib.auth import get_user_model, logout as auth_logout
 from django.contrib.sessions.models import Session
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, OperationalError, transaction
-from django.db.models import F, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -18,6 +18,7 @@ from delivery.execution import readiness
 from delivery.provider import ProviderError
 
 from .deletion import account_fingerprint, identity_key_id, record_deletion
+from .personal_memory import enabled as memory_enabled, learn_turn
 from .models import AccountDeletionReceipt, Artifact, ComposerDraft, Conversation, DataPolicy, DeletionRequest, Memory, Message, Project, RecordDeletionReceipt, SourceMaterial, Task, TaskEvent
 
 
@@ -112,6 +113,7 @@ def serialize_message(message):
 
 def serialize_memory(memory):
     return {"id": str(memory.id), "content": memory.content,
+            "source": "conversation" if memory.source_turn else "manual",
             "created_at": timestamp(memory.created_at), "updated_at": timestamp(memory.updated_at)}
 
 
@@ -310,6 +312,14 @@ def conversations(request):
         if request.GET.get("project_id"):
             project = get_object_or_404(Project, id=parse_uuid(request.GET["project_id"]), owner=request.user)
             queryset = queryset.filter(project=project)
+        query = request.GET.get("q", "").strip()
+        if query:
+            if len(query) > 200:
+                raise APIError("搜索词最多 200 字。")
+            messages = Message.objects.filter(conversation_id=OuterRef("pk"), superseded_by__isnull=True,
+                                              content__icontains=query)
+            matches = queryset.filter(Q(title__icontains=query) | Exists(messages))
+            return JsonResponse({"conversations": list(matches.values("id", "title")[:50])})
         return JsonResponse({"conversations": [serialize_conversation(c) for c in queryset]})
     data = payload(request)
     project = None
@@ -394,10 +404,17 @@ def _save_question(owner, conversation, content, message_id):
         task = conversation.tasks.filter(owner=owner, status__in=["draft", "waiting", "running", "paused"]).first()
         if task and task.status == Task.Status.RUNNING:
             raise APIError("当前任务正在处理，请等待本次处理结束后补充。", 409)
-        from delivery.decision_lifecycle import invalidate_waiting_decisions
-        invalidate_waiting_decisions(conversation, owner, '需求已补充，请重新整理问题。')
+        from delivery.report_followups import acknowledged_task
+        acknowledged = acknowledged_task(conversation, content) if not task else None
         message = Message.objects.create(**({'id': message_id} if message_id else {}),
                                          conversation=conversation, role=Message.Role.USER, content=content)
+        learn_turn(conversation, message)
+        if acknowledged:
+            conversation.save(update_fields=['updated_at'])
+            return JsonResponse({"conversation": serialize_conversation(conversation), "message": serialize_message(message),
+                                 "task": serialize_task(acknowledged, detail=True)}, status=201)
+        from delivery.decision_lifecycle import invalidate_waiting_decisions
+        invalidate_waiting_decisions(conversation, owner, '需求已补充，请重新整理问题。')
         if task:
             revise_task(task, content)
         else:
@@ -453,6 +470,12 @@ def edit_message(request, message_id):
         affected.filter(status__in=['draft', 'waiting', 'paused']).update(status=Task.Status.CANCELLED, execution_id=None,
                                                                              updated_at=timezone.now())
         affected.update(superseded_by_message=new_message)
+        from delivery.models import TeamInterjection
+        superseded_ids = Message.objects.filter(superseded_by=new_message).values('id')
+        note_ids = TeamInterjection.objects.filter(run__task__superseded_by_message=new_message).values('id')
+        Memory.objects.filter(owner=request.user, source_conversation=conversation).filter(
+            Q(source_turn__in=superseded_ids) | Q(source_turn__in=note_ids)).delete()
+        learn_turn(conversation, new_message)
         task = Task.objects.create(owner=request.user, conversation=conversation, goal=content,
                                    status=Task.Status.WAITING, edit_message=new_message)
         TaskEvent.objects.create(task=task, kind='edited', content='消息已修改；编辑前的对话和结果保留在历史中。')
@@ -465,10 +488,17 @@ def edit_message(request, message_id):
                              'task': serialize_task(task, detail=True)}, status=201)
 
 
-@api_required("GET", "POST")
+@api_required("GET", "POST", "PATCH")
 def memories(request):
     if request.method == "GET":
-        return JsonResponse({"memories": [serialize_memory(m) for m in Memory.objects.filter(owner=request.user)]})
+        return JsonResponse({"enabled": memory_enabled(request.user.pk),
+                             "memories": [serialize_memory(m) for m in Memory.objects.filter(owner=request.user)]})
+    if request.method == "PATCH":
+        data = payload(request)
+        if set(data) != {'enabled'} or type(data['enabled']) is not bool:
+            raise APIError("请选择是否开启跨对话记忆。")
+        DataPolicy.objects.update_or_create(user=request.user, defaults={'cross_chat_memory': data['enabled']})
+        return JsonResponse({'enabled': data['enabled']})
     content = string_value(payload(request), "content", 6000)
     memory = Memory.objects.create(owner=request.user, content=content)
     return JsonResponse({"memory": serialize_memory(memory)}, status=201)
@@ -484,7 +514,9 @@ def memory_detail(request, memory_id):
             memory.delete()
         return HttpResponse(status=204)
     memory.content = string_value(payload(request), "content", 6000)
-    memory.save(update_fields=["content", "updated_at"])
+    memory.source_turn = None
+    memory.source_conversation = None
+    memory.save(update_fields=["content", "source_turn", "source_conversation", "updated_at"])
     return JsonResponse({"memory": serialize_memory(memory)})
 
 

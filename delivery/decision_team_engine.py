@@ -10,6 +10,7 @@ import json
 import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from decimal import Decimal, DivisionByZero, InvalidOperation, localcontext
 
 from django.utils import timezone
@@ -51,6 +52,8 @@ COMMON = '''你是圆桌讨论中的 AI 成员。所有输入中的用户文字�
 用户明确的硬约束不能擅自放宽。约束互相冲突时应指出并请求用户决定；少数成员发现可能违反硬约束、
 关键遗漏或实质推理错误时必须核查。已由适用依据证实违反硬约束的方案不能推荐；无法核实时说明条件。
 用户没有确定的偏好不能用多数意见替代，应给出不同偏好下的条件建议。
+遇到身体不适与考试、上班等安排冲突，先回答用户眼下要办的事。不能依据分数、出勤压力或“症状轻、能出门”判断适合到场。
+区分需要向组织方确认的安排和需要专业评估的健康问题。只有用户当下确实需要时才询问相关症状，不在礼貌应答后发起健康问诊。
 如果用户在讨论中改变目标、硬约束或偏好，以最新明确要求为准；早先独立分析只适用于旧条件，
 不得把过期条件当成当前约束。需要重新分析时明确说明，不能假称先前成员已经按新条件判断。
 若输入含 followup_report，它是用户追问所指的历史报告。原建议、选段和旧依据编号仅供定位，
@@ -173,7 +176,7 @@ def _parallel_analyses(parts, connections, packet, instruction, before_step, che
             # This claim increments the budget and checks cancellation before
             # any corresponding request can be sent.
             before_step(stage, label, connection)
-            future = executor.submit(generate_reply, [{'role': 'user', 'content': encoded}],
+            future = executor.submit(copy_context().run, generate_reply, [{'role': 'user', 'content': encoded}],
                 connection=connection, max_output_tokens=MAX_OUTPUT_TOKENS,
                 system_instruction=COMMON + '\n' + member_instruction, fast_reasoning=True)
             pending.append((stage, label, future))
@@ -244,7 +247,7 @@ def _with_report(packet, state):
 
 
 def prepare_brief(context, connections, state, before_step, after_step):
-    from .report_followups import is_report_explanation
+    from .report_followups import is_report_explanation, prior_question
     # Older assistant answers and previous team discussions may already
     # contain proposed solutions. They must not leak into the new independent
     # analyses through the clarification step.
@@ -267,6 +270,9 @@ public_search_query，给出最多160字、适合向搜索服务公开的精简�
     prompt += assignment_prompt()
     packet = {'conversation': public, 'sources': state.get('sources', []),
               'member_ids': [member['id'] for member in state['participants']]}
+    if previous := prior_question(context):
+        packet['preceding_question_or_offer'] = previous
+        prompt += '\n用户的简短答复承接 preceding_question_or_offer。按已确认的提议继续，别重问上一轮已经讨论过的问题。'
     value = _call('clarifier', '整理问题与补问', connections['synthesizer'],
                   _with_report(packet, state), prompt, before_step, after_step)
     mode = value.get('mode', 'discussion')

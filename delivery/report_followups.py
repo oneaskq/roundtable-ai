@@ -5,6 +5,51 @@ from workspace.models import Message
 from .models import TeamRun
 
 
+RECEIPTS = ('好', '好的', '好啊', '好嘞', '可以', '可以的', '行', '没问题', '收到', '收到了', '明白', '明白了',
+            '了解了', '知道了', '谢谢', '谢谢你', '谢谢你们', '好的，谢谢', '收到，谢谢', 'ok', 'okay', 'thanks', 'got it', '👍')
+_INVITATION = re.compile(r'[？?]|要不要|需不需要|需要我|要我帮|我(?:们)?(?:还|也)?可以(?:帮|替|为|给)'
+                         r'|(?:你|您)(?:能否|是否|愿意|方便|能不能)|(?:请|可以)告诉我|如果你愿意'
+                         r'|\b(?:shall I|would you|do you want|I can help)\b', re.I)
+
+
+def receipt_word(text):
+    return text.strip().rstrip('。.!！~～').strip().casefold()
+
+
+def report_receipts(state):
+    advice = (state.get('summary') or {}).get('recommendation')
+    return RECEIPTS if isinstance(advice, str) and advice.strip() and not _INVITATION.search(advice) else ()
+
+
+def acknowledged_task(conversation, text):
+    """Bind a standalone acknowledgement to the latest finished report on this branch."""
+    word = receipt_word(text)
+    if word not in RECEIPTS:
+        return None
+    task = conversation.tasks.filter(owner_id=conversation.owner_id, superseded_by_message__isnull=True).first()
+    if not task or task.status != 'completed':
+        return None
+    run = task.runs.first()
+    if not run or run.workflow != 'decision_v1' or run.status != 'completed' or word not in report_receipts(run.decision_state):
+        return None
+    from workspace.sources import sources_revision
+    sources = conversation.sources.filter(owner_id=conversation.owner_id)
+    if (run.source_revision and run.source_revision != sources_revision(sources)) or (not run.source_revision and sources.exists()):
+        return None
+    last = conversation.messages.filter(role='assistant', superseded_by__isnull=True).last()
+    return task if last and str(last.pk) == run.decision_state.get('result_message_id') else None
+
+
+def prior_question(context):
+    if (len(context) < 2 or receipt_word(context[-1]['content']) not in RECEIPTS
+            or context[-1].get('role') != 'user' or context[-2].get('role') != 'assistant'):
+        return ''
+    text = context[-2]['content']
+    if text.startswith('## 当前建议与条件\n'):
+        text = text.partition('\n')[2].partition('\n\n')[0]
+    return text[-2000:] if _INVITATION.search(text) else ''
+
+
 _QUOTE = re.compile(r'^引用第 ([1-9]\d{0,5}) 份圆桌报告[：:]\n((?:>[^\n]*(?:\n|$))+)(?:\n)?([\s\S]*)$')
 _FOLLOWUP = re.compile(
     r'(?:刚才|前面|上面|上次|之前|上一轮|上一份|上文|上述).{0,10}(?:建议|说的|提到|回答|结论|报告|依据|方案|第.{1,4}[条点项个])'

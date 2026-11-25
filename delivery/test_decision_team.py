@@ -497,6 +497,30 @@ class DecisionWorkflowTests(TestCase):
         body = {'run_id': str(run.id), 'brief': brief, 'confirm_continue': True, 'expected_max_calls': 14}
         return self.client.post(self.confirm_url, json.dumps(body), content_type='application/json'), body
 
+    @patch('delivery.provider._request')
+    def test_queued_discussion_sends_current_personal_memory_to_members(self, transport):
+        fact = '以后回答请先给结论'
+        saved = self.client.post('/api/conversations', {'client_message_id': str(uuid.uuid4()), 'content': fact},
+                                 content_type='application/json')
+        self.assertEqual(saved.status_code, 201)
+        self.assertEqual(self.submit().status_code, 202)
+        note = self.client.get('/api/memories').json()['memories'][0]
+        changed = '每次回答先给出一句建议'
+        self.client.patch('/api/memories/' + note['id'], {'content': changed}, content_type='application/json')
+
+        def reply(_connection, _path, payload, **_kwargs):
+            packet = json.loads(payload['messages'][-1]['content'])
+            self.assertEqual(packet['personal_memories'], [changed])
+            return {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content':
+                    json.dumps(fixture(AgentStep.objects.get(status='running').role), ensure_ascii=False)}}]}
+
+        transport.side_effect = reply
+        self.assertIsNotNone(process_next_run())
+        self.assertEqual(transport.call_count, 2)
+        run = TeamRun.objects.get(task=self.task)
+        self.assertEqual(run.status, 'awaiting_input')
+        self.assertNotIn(changed, json.dumps(run.input_context, ensure_ascii=False))
+
     @patch('delivery.decision_team_engine.generate_reply')
     def test_pause_for_user_confirmation_resume_once_export_and_delete(self, generate):
         generate.side_effect = self.generate

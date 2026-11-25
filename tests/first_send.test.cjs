@@ -55,6 +55,18 @@ function setup({loseAck = false, beforeResponse} = {}) {
   $('#message-input').value = '比较两份实习说明';
   return {state,$,posts,runs,submit,confirm,context:c};
 }
+test('a receipt after a finished recommendation saves immediately without team consent or a new run', async () => {
+  const f = setup();
+  f.state.conversation = {id:'completed-chat'};
+  f.state.messages = [{id:'report',role:'assistant',content:'先确认到货日期。'}];
+  f.state.tasks = [{id:'done',status:'completed',runs:[{decision:{result_message_id:'report',acknowledgements:['可以的']}}]}];
+  f.$('#message-input').value = '可以的。';
+  await f.submit();
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.posts[0].body.content, '可以的。');
+  assert.deepEqual(f.runs, []);
+});
+
 test('cancel preserves question and attachments; save only never starts a run', async () => {
   const f = setup();
   f.state.conversation = {id:'with-materials',sources_revision:'rev1',included_sources_count:2};

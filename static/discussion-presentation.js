@@ -36,8 +36,9 @@
     if (item.kind !== "assistant" || !turn || typeof turn.text !== "string") return null;
     const reference = turn.reply_to;
     const toUser = reference?.kind === "user";
+    const checkOrResponse = /^(?:review_|response_|extra_(?:review|response)$)/.test(item.role);
     let detail = item.content || "";
-    if (detail === turn.text) detail = "";
+    if ((checkOrResponse && turn.text) || detail === turn.text) detail = "";
     else if (toUser && detail.startsWith(turn.text + "\n\n")) detail = detail.slice(turn.text.length + 2);
     return {text: turn.text, decision: turn.decision, detail, detailLabel: turn.detail_label,
       reference: reference?.label && reference.text ? {
