@@ -247,10 +247,7 @@ def _with_report(packet, state):
 
 
 def prepare_brief(context, connections, state, before_step, after_step):
-    from .report_followups import is_report_explanation, prior_question
-    # Older assistant answers and previous team discussions may already
-    # contain proposed solutions. They must not leak into the new independent
-    # analyses through the clarification step.
+    from .report_followups import is_report_explanation, preceding_public_reply, prior_question
     public = _decision_conversation(context)
     prompt = '''先判断用户最后一条消息是否适合直接简短回答：普通问候、感谢、简单交流和不需要
 多方权衡或外部工具的简单问题，使用 quick 并给出自然的 quick_reply。比如 hello 只需自然打招呼，
@@ -273,6 +270,10 @@ public_search_query，给出最多160字、适合向搜索服务公开的精简�
     if previous := prior_question(context):
         packet['preceding_question_or_offer'] = previous
         prompt += '\n用户的简短答复承接 preceding_question_or_offer。按已确认的提议继续，别重问上一轮已经讨论过的问题。'
+    elif not state.get('followup_report') and (previous := preceding_public_reply(context)):
+        packet['preceding_public_reply'] = previous
+        prompt += '\npreceding_public_reply 是上一条公开答复，仅用来理解“第二个”“刚才那条”等指代或承接请求。' \
+                  '若进入讨论，只在问题说明中写清用户指的对象，勿转述旧结论当作事实、约束或已核实的依据。'
     value = _call('clarifier', '整理问题与补问', connections['synthesizer'],
                   _with_report(packet, state), prompt, before_step, after_step)
     mode = value.get('mode', 'discussion')
@@ -796,12 +797,25 @@ reason 直接回答对方刚才的具体理由，一两句说清你因此会改�
             state['stop_reason'] = '剩余额度已留给最终建议，重要新依据仍待追加核验。'
             state['unresolved'].append(state['stop_reason'])
     all_findings = findings + ((state.get('extra_round') or {}).get('reviews') or [])
+    conflicting_basis = {}
     for claim in claims.values():
         related = [finding for finding in all_findings if finding['claim_id'] == claim['id']]
         verdicts = {finding['verdict'] for finding in related}
         claim['verification_status'] = (next(iter(verdicts)) if len(verdicts) == 1 else 'unverified')
         claim['verification_ids'] = [finding['id'] for finding in related]
-        if claim['verification_status'] in ('unverified', 'user_decision'):
+        if {'supported', 'refuted'} <= verdicts:
+            sides = {'supported': [], 'refuted': []}
+            for finding in related:
+                if finding['verdict'] in sides:
+                    sides[finding['verdict']].extend(finding['evidence_ids'])
+            sides = {verdict: list(dict.fromkeys(ids)) for verdict, ids in sides.items()}
+            conflicting_basis[claim['id']] = {
+                'claim_id': claim['id'], 'text': claim['text'], 'status': 'unverified',
+                'evidence_by_verdict': sides,
+                'evidence_ids': list(dict.fromkeys(sides['supported'] + sides['refuted'])),
+            }
+            state['unresolved'].append(f'待核实主张：{claim["text"]}。需核对两方依据的适用条件。')
+        elif claim['verification_status'] in ('unverified', 'user_decision'):
             state['unresolved'].append('待核实主张：' + claim['text'])
     state['phase'] = 'synthesis'
     persist(state)
@@ -810,6 +824,7 @@ reason 直接回答对方刚才的具体理由，一两句说清你因此会改�
 recommendation 会单独显示在聊天里。日常选择通常用一两句话。第一句直接给建议，第二句只说最能改变选择的条件或一个具体的下一步。
 像当面对用户说话，省去复述题目、介绍讨论过程和逐一转述成员意见的铺垫。观念问题直接给判断和理由。
 复杂问题在这段建议里交代会改变结论的重要分歧、限制或不确定性。详细推导和用户要求的比较放在展开后的报告里。
+同一主张同时有支持和反驳证据时保留为待核实，在 unknowns 写清还需确认的原文、适用条件或数据。
 conditions、next_steps、unknowns 各写确有补充的内容，没有就留空。同一提醒只说一次。大家认同的提醒或共同缺少的事实不算意见对立。
 unknowns 只列仍待确认的问题，部分回答时保留尚未解决的部分。未核实或偏好未定时提供条件建议，
 不得把模型投票当事实，不得遗漏重要少数意见。analyses 是各成员独立分析时的原始意见；
@@ -835,6 +850,9 @@ status 和 evidence_ids 必须与该主张的核验记录相符，系统将展�
     if pending_user_messages:
         state['unresolved'].append(f'讨论结束时，还有 {len(pending_user_messages)} 条用户插话未收到直接答复。')
     state['summary'] = {'recommendation': _text(value.get('recommendation', ''), '最终建议', 3000, required=True)}
+    if conflicting_basis:
+        state['summary']['recommendation'] += (f'\n\n有 {len(conflicting_basis)} 项主张的支持和反驳依据并存，'
+                                                '详见完整报告的「主要依据」。')
     for key in ('conditions', 'next_steps', 'unknowns'):
         entries = (_text(x, key, 1000, required=True) for x in _items(value.get(key, []), key, 12))
         state['summary'][key] = list(dict.fromkeys(entries))
@@ -847,7 +865,7 @@ status 和 evidence_ids 必须与该主张的核验记录相符，系统将展�
             'tradeoffs': _text(item.get('tradeoffs', ''), '方案权衡', 1000, required=True),
             'conditions': _text(item.get('conditions', ''), '方案条件', 1000),
         })
-    state['summary']['basis'] = []
+    state['summary']['basis'] = list(conflicting_basis.values())
     for item in _items(value.get('basis', []), '依据摘要', 12):
         if isinstance(item, str):
             # Legacy-style plain text is always shown as an unverified model
@@ -862,15 +880,18 @@ status 和 evidence_ids 必须与该主张的核验记录相符，系统将展�
                 raise ProviderError('依据摘要格式无效，本轮未标记完成。')
             known_ids = {entry['id'] for entry in state['evidence']}
             basis['evidence_ids'] = list(dict.fromkeys(ref for ref in basis['evidence_ids'] if ref in known_ids))
+            if 'claim_id' in item:
+                claim_id = item['claim_id']
+                candidates = {claim_id} if isinstance(claim_id, str) and claim_id in claims else set()
+            else:
+                candidates = {key for key, claim in claims.items() if claim['text'] == basis['text']}
+            if conflicting_basis.keys() & candidates:
+                continue  # Already included with the evidence for both verdicts.
             if basis['status'] in ('supported', 'refuted'):
-                if 'claim_id' in item:
-                    claim_id = item['claim_id']
-                    candidates = {claim_id} if isinstance(claim_id, str) and claim_id in claims else set()
-                else:
-                    candidates = {key for key, claim in claims.items() if claim['text'] == basis['text']}
                 matching = [f for f in all_findings if f['verdict'] == basis['status']
                             and set(f['evidence_ids']) & set(basis['evidence_ids'])
-                            and f['claim_id'] in candidates]
+                            and f['claim_id'] in candidates
+                            and claims[f['claim_id']]['verification_status'] == basis['status']]
                 if not matching:
                     basis['status'], basis['evidence_ids'] = 'unverified', []
                 else:
@@ -908,7 +929,10 @@ BASIS_LABELS = {'supported': '资料支持（模型判断）', 'refuted': '资�
 
 
 def _basis_line(item):
-    return f'[{BASIS_LABELS[item["status"]]}] {item["text"]}'
+    line = f'[{BASIS_LABELS[item["status"]]}] {item["text"]}'
+    if sides := item.get('evidence_by_verdict'):
+        line += f'（支持依据 {"、".join(sides["supported"])}，反驳依据 {"、".join(sides["refuted"])}）'
+    return line
 
 
 def _finding_line(finding, participants, claims):

@@ -4,6 +4,7 @@ from . import team_views
 from . import quality_views
 
 urlpatterns = [
+    path('delivery-format', views.delivery_format),
     path('capabilities', views.capabilities),
     path('capabilities/', views.capabilities),
     path('release-readiness', views.release_readiness),

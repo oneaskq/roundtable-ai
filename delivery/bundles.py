@@ -140,13 +140,19 @@ class _BasicHTMLParser(HTMLParser):
         self.tags += 1
 
 
-def check_bundle(bundle):
+def check_bundle(bundle, *, required_formats=()):
     """Check text formats without executing model-produced code or formulas."""
     bundle = validate_bundle(bundle)
     checks = []
 
     def add(path, check, status, detail):
         checks.append({'path': path, 'check': check, 'status': status, 'detail': detail})
+
+    for label in required_formats:
+        extension = {'HTML': '.html', 'CSV': '.csv', 'Markdown': '.md'}[label]
+        found = any(item['path'].lower().endswith(extension) for item in bundle['files'])
+        add('', '已确认的交付格式', 'passed' if found else 'failed',
+            f'已包含 {extension} 文件。' if found else f'缺少已确认的 {extension} 文件。')
 
     for item in bundle['files']:
         path, content = item['path'], item['content']

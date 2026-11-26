@@ -8,7 +8,7 @@
   <meta name="theme-color" content="#ffffff">
   <meta name="referrer" content="no-referrer">
   <title>圆桌 · 把目标交给团队</title>
-  <link rel="stylesheet" href="{% static 'app.css' %}?v=chat-outline-1">
+  <link rel="stylesheet" href="{% static 'app.css' %}?v=0.25.1">
   <link rel="icon" type="image/svg+xml" href="{% static 'favicon.svg' %}">
   <link rel="stylesheet" href="{% static 'report-followup.css' %}?v=compact-report-2">
   <script src="{% static 'report-followup.js' %}?v=1" defer></script>
@@ -17,9 +17,9 @@
   <link rel="stylesheet" href="{% static 'discussion-status.css' %}?v=auto-lookup-1">
   <script src="{% static 'discussion-timing.js' %}?v=2" defer></script>
   <script src="{% static 'discussion-presentation.js' %}?v=chat-ui-1" defer></script>
-  <script src="{% static 'delivery-intent.js' %}?v=1" defer></script>
+  <script src="{% static 'delivery-intent.js' %}?v=0.25.1" defer></script>
   <script src="{% static 'conversation-outline.js' %}?v=1" defer></script>
-  <script src="{% static 'app.js' %}?v=chat-outline-1" defer></script>
+  <script src="{% static 'app.js' %}?v=0.25.1" defer></script>
 </head>
 <body>
   <div class="csrf-holder" hidden>{% csrf_token %}</div>
@@ -146,6 +146,12 @@
             </div>
           </form>
           <div class="composer-status"><span id="availability-text">正在读取模型状态；现在可以保存需求。</span><span id="draft-status" role="status" hidden></span></div>
+          <section id="draft-conflict" class="draft-conflict" aria-label="草稿版本冲突" hidden>
+            <p role="status">草稿有两个版本。输入框保留了此页的内容。</p>
+            <details><summary>查看已保存的版本</summary><pre id="draft-conflict-preview"></pre></details>
+            <button id="draft-use-local" type="button" class="text-button">保留输入框版本</button>
+            <button id="draft-use-saved" type="button" class="text-button">使用已保存版本</button>
+          </section>
           <p id="composer-hint" class="sr-only">Enter 发送 · Shift + Enter 换行</p>
         </div>
       </section>

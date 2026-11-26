@@ -258,17 +258,27 @@ def project_detail(request, project_id):
     return JsonResponse({"project": serialize_project(project)})
 
 
+def serialize_draft(draft):
+    return {'conversation_id': str(draft.conversation_id) if draft.conversation_id else None,
+            'project_id': str(draft.project_id) if draft.project_id else None,
+            'content': draft.content, 'updated_at': timestamp(draft.updated_at),
+            'writer_id': str(draft.writer_id) if draft.writer_id else None, 'sequence': draft.sequence}
+
+
 @api_required("GET", "POST")
 def composer_drafts(request):
     if request.method == 'GET':
-        drafts = ComposerDraft.objects.filter(owner=request.user).exclude(content='').select_related('conversation')
-        return JsonResponse({'drafts': [{'conversation_id': str(d.conversation_id) if d.conversation_id else None,
-                                         'project_id': str(d.project_id) if d.project_id else None,
-                                         'content': d.content, 'updated_at': timestamp(d.updated_at)}
-                                        for d in drafts if not d.conversation_id or d.conversation.owner_id == request.user.id]})
+        drafts = ComposerDraft.objects.filter(Q(conversation__isnull=True) | Q(conversation__owner=request.user),
+                                              owner=request.user)
+        if request.GET.get('include_cleared') != '1':
+            drafts = drafts.exclude(content='', project__isnull=True)
+        return JsonResponse({'drafts': [serialize_draft(draft) for draft in drafts]})
     data = payload(request)
-    if set(data) != {'conversation_id', 'project_id', 'content', 'writer_id', 'sequence'}:
+    if set(data) - {'base_revision'} != {'conversation_id', 'project_id', 'content', 'writer_id', 'sequence'}:
         raise APIError('草稿内容格式不正确。')
+    base = data.get('base_revision')
+    if base is not None and (not isinstance(base, str) or len(base) > 64):
+        raise APIError('草稿版本格式不正确。')
     content = data['content']
     if not isinstance(content, str) or len(content) > 12000:
         raise APIError('草稿内容超过允许长度。')
@@ -293,16 +303,24 @@ def composer_drafts(request):
         if conversation and project_id:
             raise APIError('已存在的对话不支持更改草稿项目。')
         project = get_object_or_404(Project, id=project_id, owner=request.user) if project_id else None
-        draft, _ = ComposerDraft.objects.select_for_update().get_or_create(
-            owner=request.user, conversation=conversation)
-        if draft.writer_id == writer_id and sequence <= draft.sequence:
-            return JsonResponse({'saved': False, 'stale': True, 'sequence': draft.sequence})
-        draft.content, draft.project, draft.writer_id, draft.sequence = content, project, writer_id, sequence
-        draft.save(update_fields=['content', 'project', 'writer_id', 'sequence', 'updated_at'])
+        draft = ComposerDraft.objects.select_for_update().filter(owner=request.user, conversation=conversation).first()
+        if draft and draft.content == content and draft.project_id == project_id:
+            return JsonResponse({'saved': True, 'revision': timestamp(draft.updated_at)})
+        if base != (timestamp(draft.updated_at) if draft else None):
+            return JsonResponse({'code': 'draft_conflict', 'error': '草稿版本已改变，请刷新后选择要保留的版本。',
+                                 'draft': serialize_draft(draft) if draft else None}, status=409)
+        values = dict(content=content, project=project, writer_id=writer_id, sequence=sequence)
+        if draft:
+            # All writers share this revision, including after clearing a draft.
+            now = max(timezone.now(), draft.updated_at + timezone.timedelta(microseconds=1))
+            ComposerDraft.objects.filter(pk=draft.pk).update(**values, updated_at=now)
+        else:
+            draft = ComposerDraft.objects.create(owner=request.user, conversation=conversation, **values)
+            now = draft.updated_at
         if conversation and content:
             # Editing an old conversation makes it active for retention purposes.
             conversation.save(update_fields=['updated_at'])
-    return JsonResponse({'saved': True})
+    return JsonResponse({'saved': True, 'revision': timestamp(now)})
 
 
 @api_required("GET", "POST")

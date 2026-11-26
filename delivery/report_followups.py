@@ -50,6 +50,21 @@ def prior_question(context):
     return text[-2000:] if _INVITATION.search(text) else ''
 
 
+def preceding_public_reply(context):
+    """Return the previous visible answer, excluding attached inputs and unpublished drafts."""
+    seen_user = False
+    for turn in reversed(context):
+        if turn['role'] == 'user':
+            seen_user = True
+        elif seen_user and turn['role'] == 'assistant':
+            text = turn['content'].strip()
+            if not text or text.startswith(('【此前团队待复核材料，', '【用户选定的参考资料，', '【此前文件成果第')):
+                continue
+            # Every short group reply fits. A long report has its own reference flow.
+            return text if len(text) <= 8000 else text[:4000] + '\n[…]\n' + text[-4000:]
+    return ''
+
+
 _QUOTE = re.compile(r'^引用第 ([1-9]\d{0,5}) 份圆桌报告[：:]\n((?:>[^\n]*(?:\n|$))+)(?:\n)?([\s\S]*)$')
 _FOLLOWUP = re.compile(
     r'(?:刚才|前面|上面|上次|之前|上一轮|上一份|上文|上述).{0,10}(?:建议|说的|提到|回答|结论|报告|依据|方案|第.{1,4}[条点项个])'

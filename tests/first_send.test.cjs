@@ -11,8 +11,8 @@ function section(start, end) {
   assert.ok(from >= 0 && to > from);
   return app.slice(from, to);
 }
-function setup({loseAck = false, beforeResponse} = {}) {
-  const nodes = new Map(), storage = new Map(), posts = [], runs = [];
+function setup({loseAck = false, beforeResponse, formatCheck = () => ({requested_formats: []})} = {}) {
+  const nodes = new Map(), storage = new Map(), posts = [], runs = [], acceptedGoals = [];
   const state = {user:{id:'user1'}, view:'roundtable', viewVersion:1, authVersion:1, messages:[], tasks:[],
     messageSaveIds:new Map(), drafts:new Map(), replyFeedback:{}, conversation:null, aiConsentFor:null};
   state.capabilities = {team:{revision:'team', default_member_ids:['a','b'],
@@ -29,18 +29,19 @@ function setup({loseAck = false, beforeResponse} = {}) {
   const noop = () => {};
   const c = vm.createContext({state, $, crypto, TextEncoder, Uint8Array, window: {},
     sessionStorage:{getItem:k=>storage.get(k) || null,setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)},
-    requestReply: () => runs.push(state.conversation?.id), interjectionRun:()=>null, interjectionDraft:()=>null, pendingSubmission:()=>null,
+    requestReply: (_reuse, goal) => { runs.push(state.conversation?.id); acceptedGoals.push(goal); }, interjectionRun:()=>null, interjectionDraft:()=>null, pendingSubmission:()=>null,
     currentTask:()=>state.tasks[0], allTeamRuns:()=>state.tasks.flatMap(task=>task.runs || []),
     modelIdentity:()=>[state.deliveryMode, state.conversation?.sources_revision || 'team'].join(':'),
     sourcesUI:{getState:()=>({busy:false})}, modelName:()=>'Test A、Test B', deliveryLimit:()=>14,
     renderChat:noop,renderModelControls:noop,resizeComposer:noop,rememberConversation:noop,
     rememberDraft:noop,forgetDraft:noop,reloadConversation:async()=>{},refreshWorkspace:async()=>{},showToast:noop,
     api:async(url, opt)=>{
+      if (url === '/api/delivery-format') return formatCheck(opt.body.content);
       posts.push({url,body:opt.body});
       if (loseAck && posts.length === 1) throw new Error('lost response');
       if (beforeResponse) await beforeResponse();
       return {conversation: {id: state.conversation?.id || opt.body.client_message_id, sources_revision:state.conversation?.sources_revision},
-        message:{id:opt.body.client_message_id},task:{id:'t',status:'waiting'}};
+        message:{id:opt.body.client_message_id},task:{id:'t',status:'waiting',goal:opt.body.content}};
     }});
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../static/delivery-intent.js'), 'utf8'), c);
   vm.runInContext(section('function deliveryLimit(', 'function providerName('), c);
@@ -53,8 +54,92 @@ function setup({loseAck = false, beforeResponse} = {}) {
   vm.runInContext(app.slice(app.lastIndexOf('$("#message-input").addEventListener("input"', pagehide), pagehide), c);
   const confirm = async () => { $('#ai-consent-confirm').listeners.click(); await requested; };
   $('#message-input').value = '比较两份实习说明';
-  return {state,$,posts,runs,submit,confirm,context:c};
+  return {state,$,posts,runs,acceptedGoals,submit,confirm,context:c};
 }
+const workbookGoal = '生成一份 XLSX 工作簿';
+const csvOffer = {requested_formats:['XLSX'], replacement_formats:['CSV'], replacement_goal:'生成一份 CSV 表格'};
+
+test('an unavailable output requires an explicit alternative and fresh cost consent', async () => {
+  const f = setup({formatCheck: content => { assert.equal(content, workbookGoal); return csvOffer; }});
+  f.state.deliveryMode = 'files';
+  f.state.aiConsentFor = 'files:team';  // Prior consent to a different file request.
+  f.$('#message-input').value = workbookGoal;
+  await f.submit();
+  assert.equal(f.$('#ai-consent-confirm').textContent, '改用 CSV');
+  assert.match(f.$('#ai-consent-text').textContent, /XLSX/);
+  f.$('#ai-consent-cancel').listeners.click();
+  assert.equal(f.$('#message-input').value, workbookGoal);
+  assert.deepEqual(f.posts, []);
+  await f.submit();
+  await f.confirm();
+  assert.deepEqual(f.posts, []);
+  assert.deepEqual(f.runs, []);
+  assert.match(f.$('#ai-consent-text').textContent, /已选择交付 CSV[\s\S]*10 次/);
+  await f.confirm();
+  assert.equal(f.posts[0].body.content, workbookGoal);
+  assert.deepEqual(f.acceptedGoals, [csvOffer.replacement_goal]);
+  assert.equal(f.runs.length, 1);
+});
+
+test('a saved request keeps its original message, and checking an input file allows ordinary discussion', async () => {
+  const f = setup({formatCheck: content => content === workbookGoal ? csvOffer : {requested_formats:[]}});
+  f.state.conversation = {id:'saved'};
+  f.state.tasks = [{id:'t', goal:workbookGoal, status:'waiting'}];
+  await f.$('#request-reply').listeners.click();
+  assert.equal(f.$('#ai-consent-confirm').textContent, '改用 CSV');
+  await f.confirm();
+  await f.confirm();
+  assert.deepEqual(f.posts, []);
+  assert.deepEqual(f.acceptedGoals, [csvOffer.replacement_goal]);
+  f.$('#message-input').value = '分析上传的 PDF';
+  await f.submit();
+  assert.equal(f.state.deliveryMode, 'text');
+  assert.match(f.$('#ai-consent-text').textContent, /14 次/);
+});
+
+test('a late format check cannot act on a changed question or an unrelated conversation', async () => {
+  for (const change of ['text','conversation']) {
+    let resolve;
+    const f = setup({formatCheck: () => new Promise(done => {resolve = done;})});
+    f.$('#message-input').value = workbookGoal;
+    const checking = f.submit();
+    if (change === 'text') f.$('#message-input').value = '新问题';
+    else f.state.conversation = {id:'different'};
+    resolve(csvOffer);
+    await checking;
+    assert.ok(!f.state.pendingConsent);
+    assert.deepEqual(f.runs, []);
+    assert.deepEqual(f.posts, []);
+  }
+});
+
+test('retry carries the exact chosen format; a pre-upgrade receipt rejected for its format is released', async () => {
+  for (const accepted of [true, false]) {
+    const f = setup();
+    f.state.conversation = {id:'saved'};
+    f.state.tasks = [{id:'t', goal:workbookGoal, status:'waiting'}];
+    const body = {client_request_id:'same-request', expected_task:'t',
+      ...(accepted ? {accepted_delivery_goal:csvOffer.replacement_goal} : {})};
+    let pending = {id:'same-request', body};
+    const submissions = [];
+    Object.assign(f.context, {
+      AbortController, setTimeout, clearTimeout,
+      pendingSubmission: () => pending,
+      forgetSubmission: () => { pending = null; },
+      clearReplyMonitoring() {}, replyContextCurrent: () => true, scheduleReplyPoll() {},
+      renderReplyFeedback() {},
+      api: async (_url, options) => {
+        submissions.push(options.body);
+        if (!accepted) throw Object.assign(new Error('请选择交付格式'), {status:422, code:'unsupported_delivery_format'});
+        return {queued:true, run:{id:'run'}, task:{id:'t'}};
+      },
+    });
+    vm.runInContext(section('async function requestReply(', 'async function checkPendingSubmission('), f.context);
+    await f.context.requestReply(true);
+    assert.deepEqual(submissions, [body]);
+    assert.equal(pending, null);
+  }
+});
 test('a receipt after a finished recommendation saves immediately without team consent or a new run', async () => {
   const f = setup();
   f.state.conversation = {id:'completed-chat'};

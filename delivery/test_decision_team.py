@@ -14,7 +14,7 @@ from workspace.views import export_data
 from .background import process_next_run
 from .connections import ProviderConnection
 from .decision_team_engine import (_calculate, confirm_brief, make_state, prepare_brief,
-                                   run_decision)
+                                   report_references, run_decision)
 from .models import AgentStep, TeamInterjection, TeamRun
 from .provider import ProviderError
 
@@ -170,6 +170,19 @@ class DecisionEngineTests(TestCase):
         self.assertEqual(len(self.calls), 11)
         calc = next(e for e in self.state['evidence'] if e['type'] == 'calculation')
         self.assertEqual((calc['status'], calc['result']), ('executed', '600'))
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_visible_reply_is_only_supplied_to_clarifier_and_is_not_independent_evidence(self, generate):
+        old_reply = self.context[-1]['content']
+        self.context += [{'role': 'assistant', 'content': '【此前团队待复核材料，尚未核验】草稿'},
+                         {'role': 'user', 'content': '请比较刚才的选项'},
+                         {'role': 'assistant', 'content': '【用户选定的参考资料，由系统提取】'}]
+        generate.side_effect = self.generator
+        self.prepared()
+        run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        self.assertEqual(self.packets['clarifier']['preceding_public_reply'], old_reply)
+        for stage in ('analysis_p1', 'analysis_p2', 'analysis_p3'):
+            self.assertNotIn(old_reply, json.dumps(self.packets[stage], ensure_ascii=False))
 
     @patch('delivery.decision_team_engine.generate_reply')
     def test_interjection_can_be_cited_as_user_statement_in_later_review(self, generate):
@@ -339,6 +352,35 @@ class DecisionEngineTests(TestCase):
         self.assertEqual(valid, {'claim_id': 'P1C1', 'text': original, 'status': 'refuted', 'evidence_ids': ['E1']})
         self.assertNotIn(rewrite, result)
         self.assertTrue(all(item['status'] == 'unverified' and item['evidence_ids'] == [] for item in invalid))
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_conflicting_reviews_keep_both_sides_in_summary_and_citations(self, generate):
+        self.sources[0]['content'] += '；套餐费用500元'
+
+        def generated(messages, **kwargs):
+            value = fixture(self.stage, extra=True)
+            if self.stage == 'extra_review':
+                value['findings'][0].update(verdict='supported', evidence=[
+                    {'source': 'S1', 'quote': '套餐费用500元', 'scope': '套餐报价'}])
+            if self.stage == 'synthesizer':
+                value['basis'] = [{'claim_id': 'P1C1', 'text': '核验结果一致', 'status': 'refuted',
+                                   'evidence_ids': ['E1']}]
+            return json.dumps(value, ensure_ascii=False)
+
+        generate.side_effect = generated
+        self.prepared()
+        report = run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        basis, = self.state['summary']['basis']
+        self.assertEqual((basis['claim_id'], basis['status']), ('P1C1', 'unverified'))
+        sides = basis['evidence_by_verdict']
+        self.assertEqual(sides['supported'], self.state['extra_round']['reviews'][0]['evidence_ids'])
+        self.assertEqual(sides['refuted'], ['E1'])
+        self.assertNotIn('核验结果一致', report)
+        self.assertIn('支持和反驳依据并存', self.state['summary']['recommendation'])
+        row, = [r for r in report_references(self.state) if r['section'] == '主要依据']
+        self.assertEqual(row['ids'], sides['supported'] + sides['refuted'])
+        self.assertIn('支持依据 ' + sides['supported'][0] + '，反驳依据 E1', row['line'])
+        self.assertIn(row['line'], report)
 
     @patch('delivery.decision_team_engine.generate_reply')
     def test_summarizer_cannot_claim_support_by_inventing_evidence_ids(self, generate):

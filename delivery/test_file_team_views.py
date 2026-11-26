@@ -1,4 +1,5 @@
 import json
+import uuid
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -37,6 +38,72 @@ class FileWorkflowTests(TestCase):
         body = {'confirm_cost': True, 'expected_team': team_summary()['revision'],
                 'delivery_mode': 'files', 'expected_max_calls': 7, **changes}
         return self.client.post(self.url, json.dumps(body), content_type='application/json')
+
+    def test_format_preview_distinguishes_outputs_from_inputs(self):
+        for original, formats, replacements in [
+            ('请帮我导出一个 PDF 文件', ['PDF'], ['HTML']),
+            ('读取这份 PDF，生成 XLSX 工作簿', ['XLSX'], ['CSV']),
+            ('把报告导出 DOCX 和 PPTX', ['DOCX', 'PPTX'], ['Markdown']),
+            ('Convert input.pdf to a DOCX document', ['DOCX'], ['Markdown']),
+            ('请生成 `会议记录.docx`', ['DOCX'], ['Markdown']),
+            ('以 PDF 格式交付', ['PDF'], ['HTML']),
+            ('请按 PDF 格式输出这份报告。', ['PDF'], ['HTML']),
+            ('Could you turn this into a PDF?', ['PDF'], ['HTML']),
+        ]:
+            with self.subTest(original=original):
+                offer = self.client.post('/api/delivery-format', {'content': original}, content_type='application/json').json()
+                self.assertEqual(offer['requested_formats'], formats)
+                self.assertEqual(offer['replacement_formats'], replacements)
+                self.assertTrue(offer['replacement_goal'].startswith(original + '\n'))
+        for text in ('分析附件 PDF', '怎么导出 PDF？', '请总结这份 PDF 的内容', '读取 PDF 生成 CSV',
+                     '请生成预算表，但这次不要生成文件', '请生成 PDF，直接用文字',
+                     'Write a summary of the attached PDF', 'Make a Word cloud', 'write a 300-word summary',
+                     '解释引用\n> 导出一个 PDF', '把 PDF 导出为 CSV',
+                     '我需要这份 PDF 里的关键数据，直接列在聊天里。', 'Give me the highlights of this PDF in three bullet points.',
+                     '给我一个 Excel 公式', 'Write an Excel formula to sum these values',
+                     '给我说明 PDF 和 Word 的区别', '请生成一个可以查看 PDF 的 HTML 网页'):
+            with self.subTest(text=text):
+                self.assertEqual(self.client.post('/api/delivery-format', {'content': text},
+                                 content_type='application/json').json(), {'requested_formats': []})
+
+    @patch('delivery.file_team_engine.generate_reply')
+    def test_confirmed_substitute_is_frozen_before_queue_and_replays_once(self, generate):
+        original = '把季度预算导出成 XLSX'
+        self.task.goal = original
+        self.task.save()
+        self.message.content = original
+        self.message.save()
+        offer = self.client.post('/api/delivery-format', {'content': original}, content_type='application/json').json()
+        args = {'background': True, 'client_request_id': str(uuid.uuid4()), 'expected_task': str(self.task.pk),
+                'expected_task_updated_at': self.task.updated_at.isoformat()}
+        for options in ({}, {'accepted_delivery_goal': '另一个任务'}, {'delivery_mode': 'text'}):
+            self.assertEqual(self.post(**args, **options).json()['code'], 'unsupported_delivery_format')
+        self.assertFalse(TeamRun.objects.exists())
+        self.assertFalse(RequestBudget.objects.filter(attempts__gt=0).exists())
+        self.assertEqual(self.post(**args, accepted_delivery_goal=offer['replacement_goal']).status_code, 202)
+        run = TeamRun.objects.get()
+        self.assertEqual(run.decision_state['delivery_format'], offer)
+        self.assertIn(offer['replacement_goal'], run.input_context[-1]['content'])
+        self.assertEqual(Message.objects.get(role='user').content, original)
+        self.assertTrue(self.post(**args, accepted_delivery_goal=offer['replacement_goal']).json()['replayed'])
+        self.assertEqual(TeamRun.objects.count(), 1)
+        generate.assert_not_called()
+
+    @patch('delivery.file_team_engine.generate_reply')
+    def test_missing_confirmed_file_type_is_repaired_before_delivery(self, generate):
+        self.task.goal = '生成 XLSX'
+        self.task.save()
+        wrong = {'summary': '说明', 'files': [{'path': 'notes.md', 'content': '预算说明'}]}
+        right = {'summary': '预算表', 'files': [{'path': 'budget.csv', 'content': '部门,预算\n研发,100'}]}
+        generate.side_effect = ['独立方案', '替代方案', '审查意见', json.dumps(wrong), json.dumps(right),
+                                '{"approved":true,"issues":[]}']
+        offer = self.client.post('/api/delivery-format', {'content': self.task.goal}, content_type='application/json').json()
+        result = self.post(accepted_delivery_goal=offer['replacement_goal'])
+        self.assertEqual(result.status_code, 200, result.content)
+        run = TeamRun.objects.get()
+        self.assertFalse(run.checks[0]['passed'])
+        self.assertTrue(run.checks[1]['passed'])
+        self.assertEqual(Artifact.objects.get(kind='bundle').files, right['files'])
 
     @patch('delivery.file_team_engine.generate_reply')
     def test_file_mode_requires_explicit_seven_call_limit(self, generate):

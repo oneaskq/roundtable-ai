@@ -41,7 +41,8 @@ def save_bundle_artifact(task, owner, bundle, validation, review_status='ready',
     unsafe or malformed content ready. Recheck exactly the bytes being stored.
     """
     normalized = validate_bundle(bundle)
-    checked = check_bundle(normalized)
+    formats = run.decision_state.get('delivery_format', {}).get('replacement_formats', ()) if run else ()
+    checked = check_bundle(normalized, required_formats=formats)
     if isinstance(validation, dict) and validation.get('execution'):
         from .execution_evidence import verified_execution
         execution = verified_execution(normalized, validation['execution'])

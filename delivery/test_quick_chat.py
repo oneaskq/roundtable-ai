@@ -137,6 +137,29 @@ class QuickChatTests(TestCase):
         self.assert_quick_result('1+1等于几？', '等于 2。', generate)
 
     @patch('delivery.decision_team_engine.generate_reply')
+    def test_ordinary_followup_keeps_referent_for_the_first_member(self, generate):
+        self.message.content = '给我两个名字'
+        self.message.save(update_fields=['content'])
+        Message.objects.create(conversation=self.conversation, role='assistant', content='River 和 Cloud')
+        question = '把第二个名字译成法语'
+        self.message = Message.objects.create(conversation=self.conversation, role='user', content=question)
+
+        def answer(messages, **kwargs):
+            packet = json.loads(messages[0]['content'])
+            if AgentStep.objects.get(status='running').role == 'clarifier':
+                self.assertEqual(packet['preceding_public_reply'], 'River 和 Cloud')
+                self.assertEqual(packet['conversation'][-1]['content'], question)
+                return json.dumps({'mode': 'quick', 'quick_reply': 'Cloud 可以译作 Nuage。'})
+            return json.dumps({'reply': 'Nuage。'})
+
+        generate.side_effect = answer
+        self.start(question)
+        process_next_run()
+        run = TeamRun.objects.get()
+        self.assertEqual(run.status, 'completed')
+        self.assertIn('Cloud 可以译作 Nuage', Message.objects.get(pk=run.decision_state['result_message_id']).content)
+
+    @patch('delivery.decision_team_engine.generate_reply')
     def test_failed_member_keeps_earlier_reply_without_inventing_others(self, generate):
         from .provider import ProviderError
         from .team_views import serialize_run

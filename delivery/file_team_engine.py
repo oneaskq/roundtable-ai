@@ -44,7 +44,7 @@ class FileTeamResult:
 
 def run_file_team(context, connections, before_step, after_step, *, after_check=None,
                   preparation=None, required_tools=(), before_tool=None, acceptance_cases=None,
-                  execution_run_id='', before_discussion=None, discussion=None):
+                  execution_run_id='', before_discussion=None, discussion=None, required_formats=()):
     from .acceptance_cases import normalize_cases
     cases = normalize_cases([] if acceptance_cases is None else acceptance_cases)
     if cases and not execution_run_id:
@@ -102,7 +102,7 @@ def run_file_team(context, connections, before_step, after_step, *, after_check=
         nonlocal latest_bundle, latest_validation
         try:
             bundle = parse_bundle(raw)
-            report = check_bundle(bundle)
+            report = check_bundle(bundle, required_formats=required_formats)
             if report['passed'] and required_tools:
                 from .execution import validate_execution
                 from .execution_evidence import seal_execution

@@ -672,6 +672,11 @@ body.sidebar-collapsed .main-pane { margin-left:0; }
 .send-button:disabled { background:#e8e8e8; border:0; color:#666; opacity:1; }
 .composer-status { padding:9px 8px 0; text-align:center; color:#5e5e5e; font-size:12px; line-height:1.65; overflow-wrap:anywhere; }
 #draft-status:not([hidden]) { display:block; color:#555; }
+.draft-conflict { margin:6px 0; padding:8px 12px; border:1px solid var(--panel-border); border-radius:12px; font-size:13px; }
+.draft-conflict p { margin:0; }
+.draft-conflict pre { max-height:16vh; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.draft-conflict summary { cursor:pointer; }
+.draft-conflict button + button { margin-left:12px; }
 .live-draft { margin-top:14px; }
 .live-draft-label { margin:0 0 10px; color:#777; font-size:12px; }
 .live-draft .message-content { white-space:pre-wrap; overflow-wrap:anywhere; }

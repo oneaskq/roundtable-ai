@@ -125,7 +125,7 @@ def _require_approved(output):
 
 def run_team(context, connections, before_step, after_step, *, delivery_mode='text', after_check=None,
              workflow='fixed', after_plan=None, before_tool=None, acceptance_cases=None,
-             execution_run_id='', on_draft=None, before_discussion=None):
+             execution_run_id='', on_draft=None, before_discussion=None, required_formats=()):
     """Run five bounded stages and return only a reviewed final text.
 
     ``before_step(role, label, connection)`` runs immediately before dispatch.
@@ -143,12 +143,13 @@ def run_team(context, connections, before_step, after_step, *, delivery_mode='te
                                  delivery_mode=delivery_mode, after_check=after_check,
                                  after_plan=after_plan, before_tool=before_tool,
                                  acceptance_cases=cases, execution_run_id=execution_run_id, on_draft=on_draft,
-                                 before_discussion=before_discussion)
+                                 before_discussion=before_discussion, required_formats=required_formats)
     if workflow != 'fixed':
         raise ProviderError('不支持的协作流程。')
     if delivery_mode == 'files':
         from .file_team_engine import run_file_team
-        return run_file_team(context, connections, before_step, after_step, after_check=after_check)
+        return run_file_team(context, connections, before_step, after_step, after_check=after_check,
+                             required_formats=required_formats)
     if delivery_mode != 'text':
         raise ProviderError('不支持的成果形式。')
     public = _public_context(context)

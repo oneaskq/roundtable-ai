@@ -6,12 +6,12 @@ Object.assign(state, { capabilities: null, capabilityError: "", capabilityVersio
 state.drafts = new Map();
 state.teamChatDrafts = new Map();
 state.teamChatSending = new Map();
-state.draftWriter = (() => {
-  try { const saved = sessionStorage.getItem("roundtable:draft-writer"); if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(saved || "")) return saved;
-    const value = crypto.randomUUID(); sessionStorage.setItem("roundtable:draft-writer", value); return value; }
-  catch { return crypto.randomUUID(); }
-})();
-state.draftSequence = new Map();
+// A duplicated tab inherits sessionStorage but must have its own writer identity.
+state.draftWriter = crypto.randomUUID();
+state.draftSequence = 0;
+state.draftRevisions = new Map();
+state.draftConflicts = new Map();
+state.draftSaving = new Map();
 state.draftPending = new Map();
 state.draftTimers = new Map();
 state.draftsReady = false;
@@ -96,7 +96,9 @@ async function api(path, options = {}) {
   if (!response.ok) {
     if (response.status === 401 && state.user && data.code !== "credential_invalid") { state.user = null; showAuth(); }
     const error = new Error(typeof data.error === "string" ? data.error : "操作未完成，请稍后重试。");
-    error.status = response.status; error.code = data.code; throw error;
+    error.status = response.status; error.code = data.code;
+    if (data.code === "draft_conflict") error.draft = data.draft;
+    throw error;
   }
   return data;
 }
@@ -183,6 +185,7 @@ function cancelAutomaticChatScroll() {
   state.reportScrollTarget = null;
 }
 function closeAiConsent() {
+  state.deliveryFormatCheck = null;
   state.pendingConsent = null;
   state.consentAction = null;
   state.consentDraft = null;
@@ -220,34 +223,96 @@ function draftStatus(text = "") {
   const node = $("#draft-status"); if (!node) return;
   node.textContent = text; node.hidden = !text;
 }
+function renderDraftConflict() {
+  const panel = $("#draft-conflict");
+  if (!panel) return;
+  const key = state.conversation?.id || "new";
+  panel.hidden = !state.draftConflicts.has(key);
+  if (panel.hidden) { $("#draft-conflict-preview").textContent = ""; return; }
+  const other = state.draftConflicts.get(key);
+  const project = state.projects.find(item => item.id === other?.project_id);
+  const location = key === "new" ? (project?.title || "未归入项目") + "\n" : "";
+  $("#draft-conflict-preview").textContent = location + (other?.content || "（空草稿）");
+}
+function resolveDraftConflict(useLocal) {
+  const key = state.conversation?.id || "new";
+  if (!state.draftConflicts.has(key)) return;
+  const other = state.draftConflicts.get(key);
+  state.draftConflicts.delete(key);
+  state.draftRevisions.set(key, other?.updated_at || null);
+  const pending = state.draftPending.get(key);
+  state.draftPending.delete(key);
+  if (useLocal) {
+    queueDraft(key, state.drafts.get(key) || {text: "", project: ""});
+    void flushDraft(key);
+  } else {
+    forgetPendingDraft(state.user.id, key, pending?.payload);
+    state.drafts.set(key, {text: other?.content || "", project: other?.project_id || ""});
+    restoreDraft(); renderModelControls();
+  }
+  renderDraftConflict();
+  $("#message-input").focus();
+}
 function queueDraft(key, draft) {
   if (!state.user || !state.draftsReady) return;
-  const userId = state.user.id; const sequenceKey = `roundtable:draft-seq:${userId}:${key}`;
-  let stored = 0; try { stored = Number(sessionStorage.getItem(sequenceKey)) || 0; } catch {}
-  const sequence = Math.max(state.draftSequence.get(`${userId}:${key}`) || 0, stored) + 1;
-  try { sessionStorage.setItem(sequenceKey, String(sequence)); } catch {}
-  state.draftSequence.set(`${userId}:${key}`, sequence);
+  const userId = state.user.id;
+  const previous = state.draftPending.get(key);
   const payload = { conversation_id: key === "new" ? null : key, project_id: key === "new" ? draft.project || null : null,
-    content: draft.text, writer_id: state.draftWriter, sequence };
+    content: draft.text, writer_id: state.draftWriter, sequence: ++state.draftSequence,
+    base_revision: previous ? previous.payload.base_revision : state.draftRevisions.get(key) || null };
   state.draftPending.set(key, { userId, payload }); rememberPendingDraft(userId, key, payload);
   clearTimeout(state.draftTimers.get(key));
-  state.draftTimers.set(key, setTimeout(() => { void flushDraft(key); }, 400));
+  if (!state.draftConflicts.has(key)) state.draftTimers.set(key, setTimeout(() => { void flushDraft(key); }, 400));
 }
 async function flushDraft(key) {
-  const pending = state.draftPending.get(key); if (!pending || state.user?.id !== pending.userId) return;
-  clearTimeout(state.draftTimers.get(key)); state.draftTimers.delete(key);
+  if (state.draftSaving.has(key)) return state.draftSaving.get(key);
+  const saving = (async () => {
+    let pending = state.draftPending.get(key);
+    while (pending && state.user?.id === pending.userId && !state.draftConflicts.has(key)) {
+      clearTimeout(state.draftTimers.get(key)); state.draftTimers.delete(key);
+      await savePendingDraft(key, pending);
+      const next = state.draftPending.get(key);
+      if (next === pending) break;
+      pending = next;
+    }
+  })();
+  state.draftSaving.set(key, saving);
+  try { await saving; } finally {
+    if (state.draftSaving.get(key) === saving) state.draftSaving.delete(key);
+  }
+}
+async function savePendingDraft(key, pending) {
+  const authVersion = state.authVersion;
+  const current = () => state.authVersion === authVersion && state.user?.id === pending.userId && state.draftPending.has(key);
   try {
     const result = await api("/api/drafts", { method: "POST", body: pending.payload });
-    if (result.stale && state.draftPending.get(key) === pending) {
-      state.draftSequence.set(`${pending.userId}:${key}`, Math.max(result.sequence || 0, state.draftSequence.get(`${pending.userId}:${key}`) || 0));
-      queueDraft(key, {text: pending.payload.content, project: pending.payload.project_id || ""});
-      return;
+    if (!current()) return;
+    if (!result.saved || !result.revision) throw new Error("无法确认草稿版本。");
+    state.draftRevisions.set(key, result.revision);
+    const latest = state.draftPending.get(key);
+    if (latest === pending) {
+      forgetPendingDraft(pending.userId, key, pending.payload);
+      state.draftPending.delete(key);
+    } else {
+      latest.payload.base_revision = result.revision;
+      rememberPendingDraft(latest.userId, key, latest.payload);
     }
-    forgetPendingDraft(pending.userId, key, pending.payload);
-    if (state.draftPending.get(key) === pending) state.draftPending.delete(key);
     if (!state.draftPending.size) draftStatus();
-  } catch {
-    if (state.user?.id === pending.userId) {
+  } catch (error) {
+    if (!current()) return;
+    if (error.code === "draft_conflict") {
+      const other = error.draft;
+      // A previous save from this document may have succeeded just before its response was lost.
+      if (other && other.writer_id === pending.payload.writer_id && other.sequence < pending.payload.sequence && "base_revision" in pending.payload) {
+        const latest = state.draftPending.get(key);
+        latest.payload.base_revision = other.updated_at;
+        rememberPendingDraft(latest.userId, key, latest.payload);
+        state.draftTimers.set(key, setTimeout(() => { void flushDraft(key); }, 0));
+      } else {
+        state.draftConflicts.set(key, other);
+        draftStatus(); renderDraftConflict();
+      }
+    } else {
       draftStatus("草稿暂未保存，请检查网络；系统会继续尝试保存。");
       if (state.draftPending.get(key) === pending) state.draftTimers.set(key, setTimeout(() => { void flushDraft(key); }, 5000));
     }
@@ -255,23 +320,18 @@ async function flushDraft(key) {
 }
 async function flushDrafts() { await Promise.all([...state.draftPending.keys()].map((key) => flushDraft(key))); }
 async function loadDrafts() {
-  const userId = state.user.id;
-  // Replay a not-yet-acknowledged save from this tab before loading the server copy.
-  try {
-    const prefix = `roundtable:pending-draft:${userId}:`;
-    for (let index = sessionStorage.length - 1; index >= 0; index--) {
-      const key = sessionStorage.key(index); if (!key?.startsWith(prefix)) continue;
-      const value = JSON.parse(sessionStorage.getItem(key));
-      await api("/api/drafts", { method: "POST", body: value });
-      if (state.user?.id !== userId) return;
-      sessionStorage.removeItem(key);
-    }
-  } catch { /* A later save can retry; do not discard the stored input. */ }
-  const data = await api("/api/drafts");
-  if (state.user?.id !== userId) return;
-  state.drafts.clear();
-  for (const item of data.drafts || []) state.drafts.set(item.conversation_id || "new", {text: item.content, project: item.project_id || ""});
-  // If replay failed, prefer the unsent text still held in this tab.
+  const userId = state.user.id, version = state.authVersion;
+  let data, readError;
+  try { data = await api("/api/drafts?include_cleared=1"); }
+  catch (error) { readError = error; }
+  if (state.user?.id !== userId || state.authVersion !== version) return;
+  state.drafts.clear(); state.draftRevisions.clear();
+  for (const item of data?.drafts || []) {
+    const key = item.conversation_id || "new";
+    state.draftRevisions.set(key, item.updated_at);
+    if (item.content || item.project_id) state.drafts.set(key, {text: item.content, project: item.project_id || ""});
+  }
+  // A replay keeps its original base, even if another tab has since saved or cleared the draft.
   try {
     const prefix = `roundtable:pending-draft:${userId}:`;
     for (let index = 0; index < sessionStorage.length; index++) {
@@ -281,12 +341,19 @@ async function loadDrafts() {
         const draftKey = key.slice(prefix.length);
         state.drafts.set(draftKey, {text: value.content, project: value.project_id || ""});
         state.draftPending.set(draftKey, {userId, payload: value});
-        state.draftTimers.set(draftKey, setTimeout(() => { void flushDraft(draftKey); }, 2000));
-        draftStatus("草稿尚未同步，正在重试。");
       }
     }
   } catch { /* The server copy still works. */ }
+  if (readError?.status === 404) throw readError;
   state.draftsReady = true;
+  if (readError) {
+    draftStatus("暂时无法读取服务器草稿。此页的输入会在连接恢复后同步。");
+    for (const key of state.draftPending.keys()) {
+      state.draftTimers.set(key, setTimeout(() => { void flushDraft(key); }, 5000));
+    }
+    return;
+  }
+  await flushDrafts();
 }
 function forgetDraft(key, expectedText) {
   const draft = state.drafts.get(key);
@@ -317,6 +384,7 @@ function restoreDraft() {
   $("#message-input").value = draft?.text || "";
   if (!state.conversation) $("#composer-project").value = draft?.project || "";
   resizeComposer();
+  renderDraftConflict();
 }
 function showAuth() {
   if ($("#chat-search-dialog")?.open) $("#chat-search-dialog").close();
@@ -329,6 +397,7 @@ function showAuth() {
   state.capabilityVersion++; state.capabilities = null; state.capabilityError = ""; state.aiConsentFor = null; state.activeSave = null; state.replyFeedback = {};
   for (const timer of state.draftTimers.values()) clearTimeout(timer);
   state.draftTimers.clear(); state.draftPending.clear(); state.draftsReady = false;
+  state.draftRevisions.clear(); state.draftConflicts.clear(); state.draftSaving.clear(); renderDraftConflict();
   draftStatus();
   state.drafts.clear(); if ($("#conversation-search")) $("#conversation-search").value = "";
   state.teamChatDrafts.clear(); state.teamChatSending.clear();
@@ -922,7 +991,7 @@ async function submitClarification(answer, previous = null, {resumeLookupOnly = 
     if (operation.authVersion === state.authVersion) renderModelControls();
   }
 }
-async function requestReply(reusePending = false) {
+async function requestReply(reusePending = false, acceptedGoal = null) {
   const task = currentTask();
   if (task?.runs?.[0]?.status === "awaiting_input" && !state.replyFeedback[state.conversation?.id]?.briefStale) return;
   if (sourcesUI?.getState().busy) return;
@@ -934,7 +1003,8 @@ async function requestReply(reusePending = false) {
     expected_team: state.capabilities.team.revision, expected_acceptance: state.conversation.acceptance_revision,
     expected_task: task.id, expected_task_updated_at: task.updated_at, expected_sources: state.conversation.sources_revision,
     delivery_mode: state.deliveryMode === "files" ? "files" : "text", workflow: state.deliveryMode === "text" ? "decision_v1" : "adaptive", expected_max_calls: deliveryLimit(),
-    participant_ids: selectedMembers().map(member => member.id) };
+    participant_ids: selectedMembers().map(member => member.id),
+    ...(acceptedGoal ? {accepted_delivery_goal: acceptedGoal} : {}) };
   const request = { conversationId: state.conversation.id, taskId: task.id, viewVersion: state.viewVersion, authVersion: state.authVersion, controller: new AbortController(), clientRequestId };
   if (!reusePending && !rememberSubmission(request.conversationId, {id: clientRequestId, body})) {
     showToast("浏览器无法保存本次提交标识，请允许会话存储后重试；本轮未开始。", true); return;
@@ -966,7 +1036,7 @@ async function requestReply(reusePending = false) {
   } catch (error) {
     if (state.activeReply !== request || !replyContextCurrent(request)) return;
     if ((!reusePending && error.status >= 400 && error.status < 500 && error.status !== 408) ||
-        (reusePending && error.code === "acceptance_task_changed")) forgetSubmission(request.conversationId, request.clientRequestId);
+        (reusePending && ["acceptance_task_changed", "unsupported_delivery_format"].includes(error.code))) forgetSubmission(request.conversationId, request.clientRequestId);
     else { state.aiConsentFor = null; }
     state.activeReply = null;
     clearReplyMonitoring(request);
@@ -1092,7 +1162,7 @@ async function sendMessageEdit() {
     if (save?.isConnected) save.disabled = false; if (cancel?.isConnected) cancel.disabled = false;
     if (operation.authVersion === state.authVersion) renderModelControls();
   }
-  if (shouldReply && operation.authVersion === state.authVersion && operation.version === state.viewVersion && state.conversation?.id === operation.conversationId) await requestReply();
+  if (shouldReply && operation.authVersion === state.authVersion && operation.version === state.viewVersion && state.conversation?.id === operation.conversationId) await startSavedDelivery();
 }
 function renderChat(preserveArtifacts = false) {
   const scroller = $("#chat-scroll");
@@ -2007,6 +2077,8 @@ document.addEventListener("keydown", event => {
   }
 });
 $("#composer-project").addEventListener("change", () => { rememberDraft(); renderModelControls(); });
+$("#draft-use-local").addEventListener("click", () => resolveDraftConflict(true));
+$("#draft-use-saved").addEventListener("click", () => resolveDraftConflict(false));
 $("#logout").addEventListener("click", () => busy($("#logout"), async () => { rememberDraft(); await flushDrafts(); await api("/api/auth/logout", { method: "POST", body: {} }); try { sessionStorage.removeItem(`roundtable:conversation:${state.user.id}`); } catch {} state.user = null; state.auth = null; state.projects = []; state.conversations = []; showAuth(); setAuthMode("login"); }));
 $("#acceptance-open").addEventListener("click", () => { void openAcceptanceEditor(); });
 $("#acceptance-close").addEventListener("click", closeAcceptanceEditor);
@@ -2020,12 +2092,13 @@ $("#acceptance-add").addEventListener("click", () => {
 });
 $("#acceptance-reload").addEventListener("click", () => { if (state.acceptanceEditor) void loadAcceptanceEditor(state.acceptanceEditor); });
 $("#acceptance-form").addEventListener("submit", saveAcceptanceEditor);
-function promptAIConsent(action) {
+function promptAIConsent(action, format = null, chooseFormat = false) {
   if (!chatAvailable() || state.activeSave || state.activeReply || sourcesUI?.getState().busy) return;
   state.pendingConsent = modelIdentity();
   state.consentAction = action;
   state.consentDraft = {conversationId: state.conversation?.id, version: state.viewVersion,
-    text: action === "send" ? $("#message-input").value : null, taskId: currentTask()?.id};
+    text: action === "send" ? $("#message-input").value : null, taskId: currentTask()?.id,
+    taskRevision: currentTask()?.updated_at, format, chooseFormat};
   const count = state.conversation?.included_sources_count || 0;
   const materials = count ? `，以及所选 ${count} 份材料的文字与出处` : "";
   const cost = state.deliveryMode === "text"
@@ -2033,24 +2106,71 @@ function promptAIConsent(action) {
     : `${state.deliveryMode === "files" ? "本轮将制作可下载的文件，支持 Markdown、纯文本、CSV、JSON、网页和源码。" : ""}每轮最多调用 ${deliveryLimit()} 次。`;
   $("#ai-consent-text").textContent = `参与的模型将收到本次对话、相关成果和成员回复${materials}。开启跨对话记忆时，也会收到相关的个人记忆。参与成员：${modelName()}。${cost}使用已配置账号的额度，可能产生费用。`;
   $("#ai-consent-save").hidden = action !== "send";
-  $("#ai-consent-confirm").textContent = "确认并开始";
+  if (chooseFormat) {
+    const mapping = format.format_description || `可按 ${format.replacement_formats.join("、")} 交付`;
+    $("#ai-consent-text").textContent = `目前无法生成 ${format.requested_formats.join("、")} 文件。\n${mapping}。其余要求沿用原文。`;
+  } else if (format) {
+    $("#ai-consent-text").textContent = `已选择交付 ${format.replacement_formats.join("、")}，其余要求沿用原文。\n` + $("#ai-consent-text").textContent;
+  }
+  $("#ai-consent-confirm").textContent = chooseFormat ? `改用 ${format.replacement_formats.join("、")}` : "确认并开始";
   $("#ai-consent").hidden = false;
   $("#composer-options").open = false;
   $("#ai-consent-confirm").focus();
 }
+async function checkDeliveryFormat(action, content) {
+  const check = {version: state.viewVersion, account: state.authVersion, conversation: state.conversation?.id,
+    task: currentTask()?.id, revision: currentTask()?.updated_at, model: modelIdentity()};
+  state.deliveryFormatCheck = check;
+  const current = () => state.deliveryFormatCheck === check && state.view === "roundtable" &&
+    check.version === state.viewVersion && check.account === state.authVersion && check.conversation === state.conversation?.id &&
+    check.task === currentTask()?.id && check.revision === currentTask()?.updated_at && check.model === modelIdentity() &&
+    (action === "send" ? $("#message-input").value.trim() : currentTask()?.goal) === content &&
+    !state.activeSave && !state.activeReply && !sourcesUI?.getState().busy && chatAvailable();
+  try {
+    const result = await api("/api/delivery-format", {method: "POST", body: {content}});
+    if (!current()) return false;
+    if (!Array.isArray(result.requested_formats)) throw new Error("暂时无法确认可交付的文件格式，请重试。");
+    if (!result.requested_formats.length) return true;
+    if (!result.replacement_formats?.length || !result.replacement_goal) throw new Error("此文件格式暂不支持，请调整需求。");
+    setDeliveryMode("files");
+    state.aiConsentFor = null;
+    promptAIConsent(action, result, true);
+  } catch (error) {
+    if (current()) showToast(error.message || "暂时无法确认可交付的文件格式，请重试。", true);
+  } finally {
+    if (state.deliveryFormatCheck === check) state.deliveryFormatCheck = null;
+  }
+  return false;
+}
+async function startSavedDelivery() {
+  if (!chatAvailable()) return;
+  restoreConversationMode();
+  const goal = currentTask()?.goal || "";
+  if (window.RoundtableDelivery.mentionsOfficeFormat(goal) && !await checkDeliveryFormat("saved", goal)) return;
+  if (!hasTeamConsent()) { promptAIConsent("saved"); return; }
+  await requestReply();
+}
 $("#ai-consent-confirm")?.addEventListener("click", () => {
   const draft = state.consentDraft;
   if (!draft || draft.version !== state.viewVersion || draft.conversationId !== state.conversation?.id ||
-      draft.taskId !== currentTask()?.id || (draft.text !== null && draft.text !== $("#message-input").value) ||
+      draft.taskId !== currentTask()?.id || draft.taskRevision !== currentTask()?.updated_at ||
+      (draft.text !== null && draft.text !== $("#message-input").value) ||
       !state.pendingConsent || state.pendingConsent !== modelIdentity() || !chatAvailable() || currentTask()?.status === "running") {
     closeAiConsent(); renderModelControls(); return;
   }
   const action = state.consentAction;
+  if (draft.chooseFormat) {
+    promptAIConsent(action, draft.format);
+    return;
+  }
   state.aiConsentFor = state.pendingConsent; closeAiConsent(); renderModelControls();
   if ($("#composer-options")) $("#composer-options").open = false;
   $("#message-input").focus();
-  if (action === "send") $("#composer").requestSubmit();
-  else if (action === "saved") void requestReply();
+  if (action === "send") {
+    // requestSubmit dispatches synchronously. The handler takes its own copy.
+    state.confirmedSend = draft;
+    try { $("#composer").requestSubmit(); } finally { state.confirmedSend = null; }
+  } else if (action === "saved") void requestReply(false, draft.format?.replacement_goal);
 });
 $("#ai-consent-cancel")?.addEventListener("click", () => { closeAiConsent(); renderModelControls(); $("#message-input").focus(); });
 $("#refresh-connection").addEventListener("click", () => busy($("#refresh-connection"), async () => { await refreshCapabilities(); }));
@@ -2058,14 +2178,7 @@ $("#copy-connection-command").addEventListener("click", () => busy($("#copy-conn
   if (!navigator.clipboard?.writeText) { showToast("请复制文件名：配置模型.cmd"); return; }
   try { await navigator.clipboard.writeText("配置模型.cmd"); showToast("已复制文件名：配置模型.cmd"); } catch { showToast("请复制文件名：配置模型.cmd"); }
 }));
-$("#request-reply").addEventListener("click", () => {
-  restoreConversationMode();
-  if (!hasTeamConsent()) {
-    promptAIConsent("saved");
-    return;
-  }
-  void requestReply();
-});
+$("#request-reply").addEventListener("click", startSavedDelivery);
 $("#skip-clarification").addEventListener("click", () => { void submitClarification(""); });
 $("#delete-conversation").addEventListener("click", () => {
   const id = state.conversation?.id; const authVersion = state.authVersion;
@@ -2079,6 +2192,7 @@ $("#delete-conversation").addEventListener("click", () => {
     afterDialog = () => {
       if (state.authVersion !== authVersion || state.conversation?.id !== id) return;
       state.drafts.delete(id); clearTimeout(state.draftTimers.get(id)); state.draftTimers.delete(id); state.draftPending.delete(id);
+      state.draftRevisions.delete(id); state.draftConflicts.delete(id);
       forgetPendingDraft(state.user.id, id); newConversation({skipRemember: true}); void refreshWorkspace().catch(() => {}); showToast("对话已从当前数据库删除。");
     };
   }, "此操作会删除当前数据库中的对话、消息、资料、任务和成果，无法撤销。已有备份、导出文件及外部模型已收到的数据不会自动删除。");
@@ -2121,8 +2235,8 @@ $("#message-input").addEventListener("input", () => {
 });
 window.addEventListener("pagehide", () => {
   rememberDraft();
-  for (const pending of state.draftPending.values()) {
-    if (pending.userId !== state.user?.id) continue;
+  for (const [key, pending] of state.draftPending) {
+    if (pending.userId !== state.user?.id || state.draftConflicts.has(key)) continue;
     void fetch("/api/drafts", {method: "POST", credentials: "same-origin", keepalive: true,
       headers: {"Content-Type": "application/json", "X-CSRFToken": csrfToken()}, body: JSON.stringify(pending.payload)}).catch(() => {});
   }
@@ -2141,14 +2255,18 @@ $("#composer").addEventListener("submit", async (event) => {
     await submitClarification(content); return;
   }
   if (sourcesUI?.getState().busy) return;
-  setRequestedDeliveryMode(content);
+  const confirmed = state.confirmedSend;
+  const acceptedGoal = confirmed?.format?.replacement_goal;
+  if (acceptedGoal) setDeliveryMode("files");
+  else setRequestedDeliveryMode(content);
   const saveOnly = event.submitter?.id === "ai-consent-save";
   const receiptOnly = acknowledgesReport(content);
   if (saveOnly) {
     if (state.consentAction !== "send") return;
     closeAiConsent();
-  } else if (!receiptOnly && chatAvailable() && !hasTeamConsent() && currentTask()?.status !== "paused") {
-    promptAIConsent("send"); return;
+  } else if (!receiptOnly && chatAvailable() && currentTask()?.status !== "paused") {
+    if (!confirmed && window.RoundtableDelivery.mentionsOfficeFormat(content) && !await checkDeliveryFormat("send", content)) return;
+    if (!hasTeamConsent()) { promptAIConsent("send"); return; }
   }
   const operation = { version: state.viewVersion, authVersion: state.authVersion, wantReply: !saveOnly && !receiptOnly && chatAvailable() && hasTeamConsent(), model: modelIdentity(), draftKey: state.conversation?.id || "new", draftText: $("#message-input").value };
   state.conversationRevision++; state.activeSave = operation; renderModelControls(); let shouldReply = false;
@@ -2187,7 +2305,7 @@ $("#composer").addEventListener("submit", async (event) => {
     await refreshWorkspace().catch(() => {});
   } catch (error) { if (operation.authVersion === state.authVersion && operation.version === state.viewVersion) showToast(error.message || "需求暂未保存，请重试。", true); }
   finally { if (state.activeSave === operation) state.activeSave = null; if (operation.authVersion === state.authVersion) renderModelControls(); }
-  if (shouldReply && contextCurrent()) await requestReply();
+  if (shouldReply && contextCurrent() && (!acceptedGoal || currentTask()?.goal === content)) await requestReply(false, acceptedGoal);
 });
 $("#pause-task").addEventListener("click", () => busy($("#pause-task"), async () => {
   const task = currentTask(); if (!task) return; const version = state.viewVersion; const conversationId = state.conversation.id;

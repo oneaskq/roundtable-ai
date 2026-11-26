@@ -41,7 +41,7 @@ def work_roles(ordered, connections):
 
 def run_adaptive_team(context, connections, before_step, after_step, *, delivery_mode='text',
                       after_check=None, after_plan=None, before_tool=None, acceptance_cases=None,
-                      execution_run_id='', on_draft=None, before_discussion=None):
+                      execution_run_id='', on_draft=None, before_discussion=None, required_formats=()):
     if delivery_mode not in ('text', 'files'):
         raise ProviderError('不支持的成果形式。')
     from .acceptance_cases import normalize_cases
@@ -113,7 +113,7 @@ def run_adaptive_team(context, connections, before_step, after_step, *, delivery
                              preparation={'plan': plan, 'work_outputs': outputs, 'review': review},
                              required_tools=tuple(plan['required_tools']), before_tool=before_tool,
                              acceptance_cases=cases, execution_run_id=execution_run_id,
-                             before_discussion=before_discussion, discussion=discussion)
+                             before_discussion=before_discussion, discussion=discussion, required_formats=required_formats)
     draft = invoke('synthesizer', '综合交付成员', 'synthesizer',
                    {'plan': plan, 'work_outputs': outputs, 'review': review},
                    ROLE_INSTRUCTIONS['synthesizer'] + '\n' + text_guidance_for_context(public))

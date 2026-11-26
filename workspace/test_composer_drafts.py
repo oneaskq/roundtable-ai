@@ -20,10 +20,10 @@ class ComposerDraftTests(TestCase):
         self.writer = str(uuid.uuid4())
         self.client.force_login(self.user)
 
-    def save(self, content, *, conversation=None, project=None, sequence=1, writer=None):
+    def save(self, content, *, conversation=None, project=None, sequence=1, writer=None, base=None):
         return self.client.post('/api/drafts', json.dumps({'conversation_id': str(conversation.id) if conversation else None,
             'project_id': str(project.id) if project else None, 'content': content,
-            'writer_id': writer or self.writer, 'sequence': sequence}), content_type='application/json')
+            'writer_id': writer or self.writer, 'sequence': sequence, 'base_revision': base}), content_type='application/json')
 
     def test_drafts_survive_new_login_are_owner_scoped_and_exported(self):
         self.assertEqual(self.save('新草稿\n  ', project=self.project).status_code, 200)
@@ -40,12 +40,42 @@ class ComposerDraftTests(TestCase):
         self.assertEqual(self.save('不可选择', project=self.project).status_code, 404)
 
     def test_stale_same_page_request_cannot_resurrect_sent_text(self):
-        self.assertEqual(self.save('未发送', sequence=1).status_code, 200)
-        self.assertEqual(self.save('', sequence=3).status_code, 200)
+        first = self.save('未发送', sequence=1).json()['revision']
+        cleared = self.save('', sequence=3, base=first).json()['revision']
         result = self.save('过期的旧内容', sequence=2)
-        self.assertEqual(result.status_code, 200)
-        self.assertTrue(result.json()['stale'])
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.json()['draft']['updated_at'], cleared)
         self.assertEqual(self.client.get('/api/drafts').json()['drafts'], [])
+        self.assertEqual(self.client.get('/api/drafts?include_cleared=1').json()['drafts'][0]['updated_at'], cleared)
+
+    def test_old_tab_cannot_overwrite_other_writer_until_choosing_a_version(self):
+        first = self.save('A 第 2 版', sequence=2).json()['revision']
+        other = self.save('B 已保存版', writer=str(uuid.uuid4()), base=first).json()['revision']
+        delayed = self.save('A 迟到的第 1 版')
+        self.assertEqual(delayed.status_code, 409)
+        self.assertEqual(delayed.json()['draft']['content'], 'B 已保存版')
+        self.assertEqual(delayed.json()['draft']['updated_at'], other)
+        self.assertGreater(other, first)
+        chosen = self.save('A 手动合并', sequence=3, base=other).json()['revision']
+        replay = self.save('A 手动合并', sequence=3, base=other)
+        self.assertEqual(replay.json(), {'saved': True, 'revision': chosen})
+        self.assertEqual(ComposerDraft.objects.get().content, 'A 手动合并')
+
+    def test_older_page_without_version_cannot_overwrite_existing_draft(self):
+        body = {'content': '待同步', 'conversation_id': None, 'project_id': None,
+                'writer_id': self.writer, 'sequence': 1}
+        first = self.client.post('/api/drafts', body, content_type='application/json').json()['revision']
+        other = self.save('其他标签的新版本', base=first,
+                          writer=str(uuid.uuid4()))
+        self.assertEqual(other.status_code, 200)
+        retry = self.client.post('/api/drafts', body, content_type='application/json')
+        self.assertEqual(retry.status_code, 409)
+        self.assertEqual(retry.json()['draft']['content'], '其他标签的新版本')
+
+    def test_selected_project_survives_without_message_text(self):
+        self.save('', project=self.project)
+        restored = self.client.get('/api/drafts').json()['drafts'][0]
+        self.assertEqual(restored['project_id'], str(self.project.id))
 
     def test_invalid_drafts_and_foreign_references_are_rejected(self):
         self.assertEqual(self.save('x' * 12001).status_code, 400)

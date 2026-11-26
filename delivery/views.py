@@ -14,6 +14,7 @@ from django.utils.crypto import constant_time_compare
 from workspace.models import Artifact, Conversation, Message, Task, TaskEvent
 from workspace.views import lock_conversation
 from .catalog import capability_catalog, chat_available, connection_revision, connection_summary, current_connection
+from .delivery_formats import delivery_format_offer
 from .provider import ProviderError, generate_reply
 from .models import AgentStep, RequestBudget, TeamRun
 
@@ -39,6 +40,21 @@ def api(method):
                 return JsonResponse({'error': '记录暂时无法更新，请刷新状态；不会自动重试模型调用。'}, status=503)
         return wrapped
     return decorate
+
+
+@api('POST')
+def delivery_format(request):
+    content = request.payload.get('content')
+    if not isinstance(content, str) or len(content) > 30000:
+        return JsonResponse({'error': '请提供最多 30000 字的需求。'}, status=400)
+    return JsonResponse(delivery_format_offer(content))
+
+
+def unsupported_format_response(offer):
+    names = '、'.join(offer['requested_formats'])
+    alternatives = '、'.join(offer['replacement_formats'])
+    return JsonResponse({'error': f'目前无法交付 {names} 文件。可以改用 {alternatives}，请先确认格式。',
+                         'code': 'unsupported_delivery_format', **offer}, status=422)
 
 
 @api('GET')
@@ -262,6 +278,9 @@ def respond(request, conversation_id):
                                    superseded_by_message__isnull=True).order_by('-created_at').first()
         if not task or task.status not in ('waiting', 'failed'):
             return JsonResponse({'error': '没有可处理的任务，或任务正在处理/已暂停。'}, status=409)
+        offer = delivery_format_offer(task.goal)
+        if offer['requested_formats']:
+            return unsupported_format_response(offer)
         if not RequestBudget.objects.filter(pk=budget.pk, attempts__lt=RequestBudget.HOURLY_LIMIT).update(attempts=F('attempts') + 1):
             return JsonResponse({'error': '已达到内测每小时 20 次调用尝试上限。'}, status=429)
         execution_id = uuid.uuid4()

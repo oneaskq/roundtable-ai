@@ -37,5 +37,10 @@
     }
     return mode;
   }
-  window.RoundtableDelivery = {requestedMode};
+  // The server decides whether a format describes an input or a requested output.
+  // This inexpensive hint avoids a local preflight for ordinary conversation.
+  function mentionsOfficeFormat(content) {
+    return /pdf|docx?|xlsx?|pptx?|excel|word|powerpoint|工作簿|电子表格|演示文稿|幻灯片/i.test(String(content || "").normalize("NFKC"));
+  }
+  window.RoundtableDelivery = {requestedMode, mentionsOfficeFormat};
 })();
