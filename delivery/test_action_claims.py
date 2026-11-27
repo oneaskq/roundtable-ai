@@ -1,11 +1,39 @@
 """A member's false claim of searching or testing fails the step; ordinary discussion does not."""
+import json
+
 from django.test import SimpleTestCase
 
-from .decision_team_engine import DRAFT_SITUATION_FIELDS, reject_unperformed_action_claims
+from .decision_team_engine import DRAFT_SITUATION_FIELDS, _member_output, reject_unperformed_action_claims
 from .provider import ProviderError
 
 
 class UnperformedActionClaimTests(SimpleTestCase):
+    def test_recommendation_can_discuss_attachments_and_code_execution(self):
+        for text in ('我查看了这两份附件里的预算',
+                     '我查阅了你刚上传的附件，里面列出了预算。',
+                     '我查看了两份附件里的预算。',
+                     '我没有运行代码，结果还未知。',
+                     '如果我运行了代码，就会知道结果。',
+                     '等我运行了代码再比较。',
+                     '我运行了代码的话，就可以比较输出。',
+                     '你在附件里写道：“我运行了代码，结果是 42”。',
+                     '财务同事运行了代码，结果是 42。',
+                     '我们正在讨论明天是否由我运行代码。'):
+            with self.subTest(text=text):
+                value = {'recommendation': text}
+                self.assertEqual(_member_output(json.dumps(value, ensure_ascii=False), '成员分析'), value)
+
+    def test_recommendation_rejects_claims_of_running_code_or_searching_a_website(self):
+        for text in ('我运行了代码，结果是 42',
+                     '我执行了脚本，结果是 42。',
+                     '本人运行过这段代码，结果是 42。',
+                     '我已联网搜索这两份附件提到的预算。',
+                     '我已搜索你的公司官网，结果如下。',
+                     '我搜索了两份资料，发现最新政策已调整。',
+                     '我查看了这两份附件里的预算，又补充了一项：我运行了代码，结果是 42。'):
+            with self.subTest(text=text), self.assertRaises(ProviderError):
+                _member_output(json.dumps({'recommendation': text}, ensure_ascii=False), '成员分析')
+
     def test_member_claims_of_unavailable_operations_are_rejected(self):
         for text in ('我已搜索最新政策，发现报名截止日期已延后。',
                      '我已经帮你搜索了两家公司的招聘信息。',

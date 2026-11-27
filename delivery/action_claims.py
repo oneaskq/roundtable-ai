@@ -24,9 +24,11 @@ _ASPECT = r'(?:了|过|到)'
 _LOOKUP = (rf'{SELF}{_MARKER}{_LINK}(?:搜索|检索|浏览(?:了)?网页)'
            rf'|{SELF}{_SAID}(?:搜(?:索)?{_ASPECT}|检索{_ASPECT}|查(?:询|阅|证|看)?{_ASPECT}'
            rf'|上网查|网上查|浏览{_ASPECT}网页)')
+_RAN = (r'(?:运行|执行|跑)(?:了|过)(?:一下|下)?(?:(?:这|那)(?:段|个|份|项|组))?'
+        r'(?:代码|程序|脚本|测试|用例|单测)')
 _ACTION = (rf'{SELF}{_MARKER}{_LINK}(?:运行(?:了)?(?:代码|程序|脚本)|执行(?:了)?(?:程序|代码|脚本|测试)|'
            r'实测|(?:外部|实际|功能|程序)?测试|部署|上线)'
-           rf'|{SELF}{_SAID}(?:跑(?:了|过)(?:一下|下)?(?:代码|程序|脚本|测试|用例|单测)|测(?:了|过)'
+           rf'|{SELF}{_SAID}(?:{_RAN}|测(?:了|过)'
            r'|(?:亲自|实际(?:上)?|实地|自己)试(?:了|过|用)'
            r'|(?:看|浏览|访问|打开|登录)(?:了|过)(?:一下|下)?(?:官网|官方网站|网站|网页|官方公告|新闻|报道)'
            r'|(?:核实|核查|查证|验证)(?:了|过)?(?:一下|下)?(?:官网|官方|网站|网页|网上|线上|最新|实时))'
@@ -42,16 +44,21 @@ _BARE = rf'(?:{SELF}|(?<!\w))(?:本轮|本次)?{_TOOL_CLAIM}(?!的)'
 _CLAIM = re.compile(rf'(?P<lookup>{_LOOKUP})|(?P<action>{_ACTION})|(?P<bare>{_BARE})')
 
 _SELF_AT = re.compile(SELF)
-_NETWORK = re.compile(r'联网|上网|网上|在线|网页')
+_NETWORK = re.compile(r'联网|上网|网上|在线|网页|外部')
 # Reading what the member was given, right after the verb: "我已检索 W1", "我查了你提供的资料".
+_MATERIAL_COUNT = r'[\d一二两三四五六七八九十百几]*[份个篇张本]'
+# A possessive alone does not establish that the member received the material ("你的公司官网").
+_MATERIAL_REFERENCE = (
+    rf'(?:(?:你|您|用户)的(?:这|那)?|这|那|上述|现有|已有|所给|本轮)(?:些|{_MATERIAL_COUNT})?'
+    rf'(?:附件|资料|材料|原文|文件|文档|表格)|{_MATERIAL_COUNT}附件')
 _PROVIDED = re.compile(
     r'\s*(?:了|过|到)?(?:一下|下)?\s*(?:'
-    r'(?:你|您|用户)(?:(?:提供|给|发|贴|上传|附|列|写|引用)(?:出|来|上)?了?)?的|'
+    r'(?:你|您|用户)(?:刚刚?|刚才|之前)?(?:提供|给我?|发|贴|上传|分享|附|列|写|引用)(?:给我|出|来|上)?了?的|'
     r'系统(?:提供|检索到|读取|找到)了?的|给定的?|提供的|附件|'
-    r'(?:上述|现有|已有|所给|这些|这份|本轮)(?:资料|材料|原文)|'
+    rf'{_MATERIAL_REFERENCE}|'
     r'(?:资料|材料|原文|上文|前文|对话|聊天记录)(?:里|中)|'
     r'[SWUBEPR]\d)')
-_CONDITIONAL = re.compile(r'(?:如果|假如|假设|要是|若是|倘若|若)$')
+_CONDITIONAL = re.compile(r'(?:如果|假如|假设|要是|若是|倘若|若|等到?)$')
 _SENTENCE_END = re.compile(r'[。！？!?；;\n]')
 _LEADING = re.compile(r'^(?:[\s，,、：:“”]|另外|此外|同时|而且|并且|然后|随后|首先|其次|最后|'
                       r'目前|现在|刚才|刚刚|这边|对此|为此|所以|因此|好的|嗯|是的)+')
@@ -64,7 +71,7 @@ NOT_SPOKEN = frozenset({'quote', 'focus', 'public_search_query'})
 
 def _is_claim(text, match):
     start = match.start()
-    if _CONDITIONAL.search(text[max(0, start - 3):start]):
+    if _CONDITIONAL.search(text[max(0, start - 3):start]) or text.startswith('的话', match.end()):
         return False  # "如果我已经测试过就好了"
     if match.group('lookup'):
         return bool(_NETWORK.search(match.group(0))) or not _PROVIDED.match(text, match.end())
