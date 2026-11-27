@@ -15,6 +15,7 @@ from decimal import Decimal, DivisionByZero, InvalidOperation, localcontext
 
 from django.utils import timezone
 
+from .action_claims import unperformed_claim_in, unperformed_claim_in_output
 from .connections import ProviderConnection
 from .decision_roles import analysis_input, assign_responsibilities, assignment_prompt
 from .provider import ProviderError, generate_reply
@@ -33,28 +34,10 @@ VERDICTS = {'supported', 'refuted', 'unverified', 'user_decision'}
 STATUS_LABELS = {'supported': '依据支持', 'refuted': '依据反驳',
                  'unverified': '暂无法核实', 'user_decision': '待用户确定'}
 CATEGORY_LABELS = {'fact': '事实', 'reasoning': '推理', 'preference': '偏好', 'information': '信息不足'}
-# Only a member's own claim of an unavailable operation is rejected ("我已搜索",
-# "已联网检索", "经实测"). Facts about the user's situation ("产品已上线两年"),
-# what the user did ("如果你已经搜索过") and retrieval the system really
-# performed ("系统已检索到 W1") are ordinary discussion and must not fail a paid step.
-_SELF = r'(?<![自你您他她诉])(?:我(?![们国省市县区校司院方军厂行部局所])|本人|笔者)'
-_SELF_MARKER = r'(?:刚(?:刚|才)?|也|还|这边)?(?:已经?|刚(?:刚|才)?|实际(?:上)?|亲自|特意|专门)'
-_SELF_LINK = (r'(?:已经?|经|完成|通过|进行了?|实际|联网|上网|在线|在网上|网上|外部|'
-              r'帮你|为你|替你|给你|帮您|为您|对此|对其|亲自|自行|去|了){0,3}')
-_SELF_ACTION = (r'(?:搜索|检索|浏览(?:了)?网页|运行(?:了)?(?:代码|程序|脚本)|'
-                r'执行(?:了)?(?:程序|代码|脚本|测试)|实测|(?:外部|实际|功能|程序)?测试|部署|上线)')
-_TOOL_CLAIM = (r'(?:(?:已经?|经过?|刚(?:刚|才)?)'
-               r'(?:(?:联网|上网|在网上|网上)(?:搜索|检索|查询|查证)|(?:运行|执行)(?:了)?(?:代码|程序|脚本)'
-               r'|(?:通过|完成)了?(?:外部|实际|功能|程序)?测试)'
-               r'|经(?:过)?(?:实测|实际测试))')
-_UNPERFORMED_ACTION = re.compile(
-    rf'{_SELF}{_SELF_MARKER}{_SELF_LINK}{_SELF_ACTION}'
-    # An implicit speaker can start a clause; don't match inside another subject's sentence.
-    rf'|(?:{_SELF}|(?<!\w))(?:本轮|本次)?{_TOOL_CLAIM}'
-)
-# Verbatim excerpts and quoted speech may contain someone else's first-person
-# words ("我已部署过三个项目" in a résumé); they are checked as evidence elsewhere.
-_QUOTED = re.compile(r'"quote"\s*:\s*"(?:[^"\\]|\\.)*"|“[^”]*”|「[^」]*」|『[^』]*』')
+UNPERFORMED_ACTION_ERROR = '模型声称执行了本轮不可用的搜索、测试或部署；该步骤未标记完成。'
+# The clarifier's draft restates the user's situation, often in the user's own
+# voice ("我已上线一个小程序"). Those fields are not the member speaking.
+DRAFT_SITUATION_FIELDS = ('goal', 'metrics', 'constraints', 'preferences', 'assumptions', 'unknowns')
 _DISCUSSION_SIGNALS = re.compile(
     r'团队|协作|多个?(?:AI|模型)|多位(?:AI|成员)|对比|比较|方案|决策|评估|风险|预算|计划|'
     r'设计|研究|查证|核验|代码|编程|合同|法律|医疗|诊断|投资|贷款|税务|'
@@ -103,10 +86,24 @@ def _parse(output, name):
     return value
 
 
-def reject_unperformed_action_claims(output):
+def reject_unperformed_action_claims(output, skip=()):
+    """Reject a member's claim of an unavailable search, test or deployment.
+
+    A JSON output is checked field by field, so quoted user words survive
+    decoding as quotes; ``skip`` names fields that describe the user's situation.
+    """
     _require_supported_review_claims(output)
-    if _UNPERFORMED_ACTION.search(_QUOTED.sub('', output)):
-        raise ProviderError('模型声称执行了本轮不可用的搜索、测试或部署；该步骤未标记完成。')
+    if unperformed_claim_in_output(output, skip):
+        raise ProviderError(UNPERFORMED_ACTION_ERROR)
+
+
+def _member_output(output, name, skip=()):
+    """Parse a member's JSON output, then check only what the member says."""
+    _require_supported_review_claims(output)
+    value = _parse(output, name)
+    if unperformed_claim_in(value, skip):
+        raise ProviderError(UNPERFORMED_ACTION_ERROR)
+    return value
 
 
 def participants(connections, count=None):
@@ -151,7 +148,7 @@ def planned_steps(state):
     return steps
 
 
-def _call(stage, label, connection, packet, instruction, before_step, after_step):
+def _call(stage, label, connection, packet, instruction, before_step, after_step, *, skip=()):
     encoded = _json(packet)
     if len(encoded) > MAX_PACKET_CHARS:
         raise ProviderError('本轮讨论资料超过上下文上限，请拆分任务后继续。')
@@ -163,8 +160,7 @@ def _call(stage, label, connection, packet, instruction, before_step, after_step
         system_instruction=COMMON + '\n' + instruction, fast_reasoning=fast_reasoning))
     # A model may still ignore the prompt. Do not publish its unsupported claim
     # that an unavailable external operation or human review was performed.
-    reject_unperformed_action_claims(output)
-    value = _parse(output, label)
+    value = _member_output(output, label, skip)
     after_step(stage, output)
     return value
 
@@ -292,7 +288,7 @@ public_search_query，给出最多160字、适合向搜索服务公开的精简�
         prompt += '\npreceding_public_reply 是上一条公开答复，仅用来理解“第二个”“刚才那条”等指代或承接请求。' \
                   '若进入讨论，只在问题说明中写清用户指的对象，勿转述旧结论当作事实、约束或已核实的依据。'
     value = _call('clarifier', '整理问题与补问', connections['synthesizer'],
-                  _with_report(packet, state), prompt, before_step, after_step)
+                  _with_report(packet, state), prompt, before_step, after_step, skip=DRAFT_SITUATION_FIELDS)
     mode = value.get('mode', 'discussion')
     if mode not in ('quick', 'discussion'):
         raise ProviderError('问题类型判断格式无效，本轮未标记完成。')
@@ -667,8 +663,7 @@ recommendation 用一两句直接回应用户关心的具体事：说出你倾�
     parts_by_stage = {f'analysis_{part["id"]}': part for part in state['participants']}
 
     def accept_parallel(stage, label, output):
-        reject_unperformed_action_claims(output)
-        value = _parse(output, label)
+        value = _member_output(output, label)
         # Validate the full structure on an isolated evidence list. Final IDs
         # are assigned later in participant order, irrespective of completion.
         temporary = dict(state)

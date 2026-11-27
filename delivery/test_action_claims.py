@@ -1,7 +1,7 @@
 """A member's false claim of searching or testing fails the step; ordinary discussion does not."""
 from django.test import SimpleTestCase
 
-from .decision_team_engine import reject_unperformed_action_claims
+from .decision_team_engine import DRAFT_SITUATION_FIELDS, reject_unperformed_action_claims
 from .provider import ProviderError
 
 
@@ -25,6 +25,58 @@ class UnperformedActionClaimTests(SimpleTestCase):
                      '{"recommendation":"我已检索相关资料，建议选 A","claims":[]}'):
             with self.subTest(text=text), self.assertRaises(ProviderError):
                 reject_unperformed_action_claims(text)
+
+    def test_colloquial_claims_of_looking_something_up_are_rejected(self):
+        for text in ('我查了一下，官网写的是每周三天。',
+                     '我搜了一下，A 公司评价不错。',
+                     '我在网上查到 A 公司去年裁员。',
+                     '我刚查过最新政策，报名已延后。',
+                     '我已经查阅了最新的招聘信息。',
+                     '我看了官网，最新政策是每周三天。',
+                     '我已核实官网信息，截止日期是 12 月 1 日。',
+                     '根据我的搜索结果，A 公司去年裁员。',
+                     '根据我的测试结果，A 更稳定。',
+                     '我这边跑了一下代码，结果是 42。',
+                     '我这边测了一下，A 更快。',
+                     '我亲自试过，A 更快。',
+                     '我看了资料，已联网搜索，结果如下。',
+                     '另外，已联网搜索，结果如下。',
+                     '{"recommendation":"我已联网搜索 W1，结果如下"}',
+                     '```json\n{"reply":"我查到 A 公司去年裁员。"}\n```'):
+            with self.subTest(text=text), self.assertRaises(ProviderError):
+                reject_unperformed_action_claims(text)
+
+    def test_reading_the_given_material_is_not_a_search(self):
+        for text in ('我检索了你提供的 S1，里面写明每周到岗三天。',
+                     '我已检索 W1，其中没有提到截止日期。',
+                     '我查了一下 P1C1 引用的原文，S1 没有这句话。',
+                     '我查了资料里的数字，合计 600 元。',
+                     '我搜集了你给的三条信息。'):
+            with self.subTest(text=text):
+                reject_unperformed_action_claims(text)
+
+    def test_clauses_sharing_another_subject_and_descriptions_are_allowed(self):
+        for text in ('先别动核心模块。你的 App 已上线半年，已通过外部测试，改动风险高。',
+                     '已通过功能测试的版本不能再改动。',
+                     '已运行代码的话，先贴出完整报错。',
+                     '我测算了一下，每月多花约 600 元。',
+                     '我检查了一下两份方案的前提。',
+                     '我推测过两种情况。',
+                     '我没有查过官网，以下只是推理。',
+                     '如果我已经测试过就好了，但本轮没有工具。'):
+            with self.subTest(text=text):
+                reject_unperformed_action_claims(text)
+
+    def test_the_users_situation_in_a_draft_is_not_the_member_speaking(self):
+        draft = ('{"mode":"discussion","goal":"我已上线一个小程序，想判断是否迁移到云服务",'
+                 '"assumptions":"已运行代码，但报错信息未提供","questions":["报错信息能贴一下吗？"]}')
+        reject_unperformed_action_claims(draft, skip=DRAFT_SITUATION_FIELDS)
+        with self.assertRaises(ProviderError):
+            reject_unperformed_action_claims(draft)
+        # The draft's own question to the user is still the member speaking.
+        with self.assertRaises(ProviderError):
+            reject_unperformed_action_claims('{"goal":"选择方案","questions":["我已联网搜索过，你看对吗？"]}',
+                                             skip=DRAFT_SITUATION_FIELDS)
 
     def test_facts_about_the_user_and_system_retrieval_are_allowed(self):
         for text in ('你提到系统已经部署到生产环境，那么回滚成本较高。',
@@ -53,7 +105,11 @@ class UnperformedActionClaimTests(SimpleTestCase):
 
     def test_quoted_first_person_material_is_not_treated_as_a_member_claim(self):
         for text in ('{"evidence":[{"source":"S1","quote":"我已部署过三个项目","scope":"简历"}]}',
-                     '你在简历里写了“我已经测试过三套系统”，这一点面试时可能被追问。'):
+                     '你在简历里写了“我已经测试过三套系统”，这一点面试时可能被追问。',
+                     # JSON escapes ASCII quotes; they are quotes again once decoded.
+                     '{"recommendation":"你说\\"我已经测试过两种方案\\"，那 A 更快可以作为依据。"}',
+                     # An assignment focus is verbatim text from the user's question.
+                     '{"assignments":[{"member":"p1","angle":"feasibility","focus":"我已上线一个小程序"}]}'):
             with self.subTest(text=text):
                 reject_unperformed_action_claims(text)
 

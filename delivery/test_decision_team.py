@@ -475,6 +475,43 @@ class DecisionEngineTests(TestCase):
         self.assertNotEqual(self.state['phase'], 'completed')
 
     @patch('delivery.decision_team_engine.generate_reply')
+    def test_member_saying_it_looked_something_up_stops_before_review(self, generate):
+        def generated(messages, **kwargs):
+            value = fixture(self.stage)
+            if self.stage == 'analysis_p2':
+                value['recommendation'] = '我查了一下，官网写的是每周三天。'
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        with self.assertRaises(ProviderError):
+            run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        self.assertNotIn('review_p1', self.calls)
+
+    @patch('delivery.decision_team_engine.generate_reply')
+    def test_the_users_own_situation_and_quoted_words_complete_the_round(self, generate):
+        question = '我已上线一个小程序，已通过功能测试。要不要迁移到云服务？'
+        self.context = [{'role': 'user', 'content': question}]
+        def generated(messages, **kwargs):
+            value = fixture(self.stage)
+            if self.stage == 'clarifier':
+                value.update(goal='我已上线一个小程序，想判断是否迁移到云服务',
+                             assumptions='已通过功能测试的版本不再改动',
+                             assignments=[{'member': f'p{index}', 'angle': angle, 'focus': '我已上线一个小程序'}
+                                          for index, angle in enumerate(('feasibility', 'resources', 'alternatives'), 1)])
+            elif self.stage == 'analysis_p1':
+                # json.dumps escapes these quotes; the member is quoting the user.
+                value['recommendation'] = '你说"已通过功能测试"，那就先别改核心模块。'
+            elif self.stage == 'review_p2':
+                value['findings'][0]['reason'] = '你的小程序已上线，已通过功能测试，迁移前要先做回滚预案。'
+            return json.dumps(value, ensure_ascii=False)
+        generate.side_effect = generated
+        self.prepared()
+        self.assertEqual(self.state['brief']['goal'], '我已上线一个小程序，想判断是否迁移到云服务')
+        self.assertEqual(self.state['participants'][0]['assignment']['focus'], '我已上线一个小程序')
+        run_decision(self.context, self.connections, self.state, self.before, self.after, lambda _: None)
+        self.assertEqual(self.state['phase'], 'completed')
+
+    @patch('delivery.decision_team_engine.generate_reply')
     def test_time_limit_stops_before_dispatching_a_late_mention_or_review(self, generate):
         generate.side_effect = self.generator
         self.prepared()

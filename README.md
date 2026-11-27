@@ -41,9 +41,10 @@ py -3.14 -c "import sys, ssl; print(sys.version.split()[0], ssl.OPENSSL_VERSION)
 
 ## 在 macOS 或 Linux 上打开
 
-`.cmd` 脚本只用于 Windows。其他系统可以在项目根目录的终端里手动完成同样的步骤，同样需要 Python 3.14：
+`.cmd` 脚本只用于 Windows。其他系统可以在项目根目录的终端里手动完成同样的步骤。同样需要 Python 3.14.10 或更高的 3.14 版本。这些系统不会自动检查版本，请先用下面第一条命令确认。Windows 脚本还要求 OpenSSL 为 3.5.9 或更高的 3.5.x；在 macOS 和 Linux 上，OpenSSL 版本取决于 Python 的来源，请保持系统和 Python 安装来源为最新：
 
 ```bash
+python3.14 -c "import sys, ssl; print(sys.version.split()[0], ssl.OPENSSL_VERSION)"
 python3.14 -m venv .venv314
 .venv314/bin/python -m pip install -r requirements.lock
 .venv314/bin/python launch.py
