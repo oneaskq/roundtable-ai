@@ -13,6 +13,9 @@ class UnperformedActionClaimTests(SimpleTestCase):
                      '我实际运行了代码，结果是 42。',
                      '我已对此进行检索，没有发现相关报道。',
                      '我已经测试过两种方案，A 更快。',
+                     '我已通过了功能测试。',
+                     '已通过功能测试。',
+                     '我已上网查询过，结果如下。',
                      '我已部署到测试环境。',
                      '本人已亲自测试，效果稳定。',
                      '已联网搜索，最新政策为每周三天。',
@@ -36,6 +39,8 @@ class UnperformedActionClaimTests(SimpleTestCase):
                      '我已经看过你提供的部署方案。',
                      '该药物已通过临床测试。',
                      '代码已测试通过，可以合并。',
+                     '该团队已运行代码，日志见附件。',
+                     '该团队已通过功能测试，日志见附件。',
                      '用户已运行代码，报错信息见资料。'):
             with self.subTest(text=text):
                 reject_unperformed_action_claims(text)

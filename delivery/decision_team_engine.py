@@ -42,14 +42,15 @@ _SELF_MARKER = r'(?:刚(?:刚|才)?|也|还|这边)?(?:已经?|刚(?:刚|才)?|�
 _SELF_LINK = (r'(?:已经?|经|完成|通过|进行了?|实际|联网|上网|在线|在网上|网上|外部|'
               r'帮你|为你|替你|给你|帮您|为您|对此|对其|亲自|自行|去|了){0,3}')
 _SELF_ACTION = (r'(?:搜索|检索|浏览(?:了)?网页|运行(?:了)?(?:代码|程序|脚本)|'
-                r'执行(?:了)?(?:程序|代码|脚本|测试)|实测|测试|部署|上线)')
-# Without a subject, only phrases that can only describe the speaker's own tools.
-_NOT_OTHERS = r'(?<![你您他她户方未不无没已刚])(?<!系统)(?<!圆桌)(?<!平台)'
+                r'执行(?:了)?(?:程序|代码|脚本|测试)|实测|(?:外部|实际|功能|程序)?测试|部署|上线)')
+_TOOL_CLAIM = (r'(?:(?:已经?|经过?|刚(?:刚|才)?)'
+               r'(?:(?:联网|上网|在网上|网上)(?:搜索|检索|查询|查证)|(?:运行|执行)(?:了)?(?:代码|程序|脚本)'
+               r'|(?:通过|完成)了?(?:外部|实际|功能|程序)?测试)'
+               r'|经(?:过)?(?:实测|实际测试))')
 _UNPERFORMED_ACTION = re.compile(
-    _SELF + _SELF_MARKER + _SELF_LINK + _SELF_ACTION
-    + '|' + _NOT_OTHERS + r'(?:已经?|经过?|刚(?:刚|才)?)'
-    r'(?:(?:联网|上网|在网上|网上)(?:搜索|检索|查询|查证)|(?:运行|执行)(?:了)?(?:代码|程序|脚本))'
-    + '|' + _NOT_OTHERS + r'经(?:过)?(?:实测|实际测试)'
+    rf'{_SELF}{_SELF_MARKER}{_SELF_LINK}{_SELF_ACTION}'
+    # An implicit speaker can start a clause; don't match inside another subject's sentence.
+    rf'|(?:{_SELF}|(?<!\w))(?:本轮|本次)?{_TOOL_CLAIM}'
 )
 # Verbatim excerpts and quoted speech may contain someone else's first-person
 # words ("我已部署过三个项目" in a résumé); they are checked as evidence elsewhere.
