@@ -39,6 +39,26 @@ py -3.14 -c "import sys, ssl; print(sys.version.split()[0], ssl.OPENSSL_VERSION)
 
 没有模型密钥时也可以创建工作区、保存问题和添加参考资料。需要看到真实 AI 回复时，再连接自己的模型服务。首次安装需要联网下载 Python 依赖。
 
+## 在 macOS 或 Linux 上打开
+
+`.cmd` 脚本只用于 Windows。其他系统可以在项目根目录的终端里手动完成同样的步骤，同样需要 Python 3.14：
+
+```bash
+python3.14 -m venv .venv314
+.venv314/bin/python -m pip install -r requirements.lock
+.venv314/bin/python launch.py
+```
+
+配置模型、验收模型和找回邮件分别对应以下命令：
+
+```bash
+.venv314/bin/python -u manage.py configure_model
+.venv314/bin/python -u manage.py verify_model --interactive
+.venv314/bin/python -u manage.py configure_recovery_mail
+```
+
+截图和扫描 PDF 的文字识别在这些系统上使用 [Tesseract](https://github.com/tesseract-ocr/tesseract)，需要安装它以及中文（`chi_sim`）或英文语言包。
+
 ## 连接模型
 
 1. 双击 **配置模型.cmd**，选择 DeepSeek、Kimi 或千问，按提示输入自己的 API 密钥、区域和模型。密钥输入时隐藏，保存在本机的加密连接文件中。
@@ -80,6 +100,8 @@ py -3.14 -c "import sys, ssl; print(sys.version.split()[0], ssl.OPENSSL_VERSION)
 .\.venv314\Scripts\python.exe manage.py test --noinput
 node --test "tests/*.test.cjs"
 ```
+
+推送到 main 或提交拉取请求时，GitHub Actions 会在 Windows 上自动运行这两组测试，并检查数据库迁移是否齐全。
 
 ## 许可
 

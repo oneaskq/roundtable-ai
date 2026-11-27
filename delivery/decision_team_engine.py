@@ -33,11 +33,27 @@ VERDICTS = {'supported', 'refuted', 'unverified', 'user_decision'}
 STATUS_LABELS = {'supported': '依据支持', 'refuted': '依据反驳',
                  'unverified': '暂无法核实', 'user_decision': '待用户确定'}
 CATEGORY_LABELS = {'fact': '事实', 'reasoning': '推理', 'preference': '偏好', 'information': '信息不足'}
+# Only a member's own claim of an unavailable operation is rejected ("我已搜索",
+# "已联网检索", "经实测"). Facts about the user's situation ("产品已上线两年"),
+# what the user did ("如果你已经搜索过") and retrieval the system really
+# performed ("系统已检索到 W1") are ordinary discussion and must not fail a paid step.
+_SELF = r'(?<![自你您他她诉])(?:我(?![们国省市县区校司院方军厂行部局所])|本人|笔者)'
+_SELF_MARKER = r'(?:刚(?:刚|才)?|也|还|这边)?(?:已经?|刚(?:刚|才)?|实际(?:上)?|亲自|特意|专门)'
+_SELF_LINK = (r'(?:已经?|经|完成|通过|进行了?|实际|联网|上网|在线|在网上|网上|外部|'
+              r'帮你|为你|替你|给你|帮您|为您|对此|对其|亲自|自行|去|了){0,3}')
+_SELF_ACTION = (r'(?:搜索|检索|浏览(?:了)?网页|运行(?:了)?(?:代码|程序|脚本)|'
+                r'执行(?:了)?(?:程序|代码|脚本|测试)|实测|测试|部署|上线)')
+# Without a subject, only phrases that can only describe the speaker's own tools.
+_NOT_OTHERS = r'(?<![你您他她户方未不无没已刚])(?<!系统)(?<!圆桌)(?<!平台)'
 _UNPERFORMED_ACTION = re.compile(
-    r'(?<![未不无没])(?:已(?:经)?|实际|亲自)(?:经|完成|通过|进行了?|实际|联网|在线|外部){0,3}'
-    r'(?:搜索|检索|浏览网页|运行代码|运行程序|执行程序|执行测试|实际测试|测试通过|部署|上线)'
-    r'|(?<![未不无没])(?:已(?:经)?|实际)(?:通过|完成)(?:了)?(?:外部|实际|功能|程序)?测试'
+    _SELF + _SELF_MARKER + _SELF_LINK + _SELF_ACTION
+    + '|' + _NOT_OTHERS + r'(?:已经?|经过?|刚(?:刚|才)?)'
+    r'(?:(?:联网|上网|在网上|网上)(?:搜索|检索|查询|查证)|(?:运行|执行)(?:了)?(?:代码|程序|脚本))'
+    + '|' + _NOT_OTHERS + r'经(?:过)?(?:实测|实际测试)'
 )
+# Verbatim excerpts and quoted speech may contain someone else's first-person
+# words ("我已部署过三个项目" in a résumé); they are checked as evidence elsewhere.
+_QUOTED = re.compile(r'"quote"\s*:\s*"(?:[^"\\]|\\.)*"|“[^”]*”|「[^」]*」|『[^』]*』')
 _DISCUSSION_SIGNALS = re.compile(
     r'团队|协作|多个?(?:AI|模型)|多位(?:AI|成员)|对比|比较|方案|决策|评估|风险|预算|计划|'
     r'设计|研究|查证|核验|代码|编程|合同|法律|医疗|诊断|投资|贷款|税务|'
@@ -88,7 +104,7 @@ def _parse(output, name):
 
 def reject_unperformed_action_claims(output):
     _require_supported_review_claims(output)
-    if _UNPERFORMED_ACTION.search(output):
+    if _UNPERFORMED_ACTION.search(_QUOTED.sub('', output)):
         raise ProviderError('模型声称执行了本轮不可用的搜索、测试或部署；该步骤未标记完成。')
 
 
